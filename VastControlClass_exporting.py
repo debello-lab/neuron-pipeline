@@ -221,6 +221,50 @@ class VASTControlClass:
             self.last_error = 2
             return None
 
+    def get_hardware_info(self) -> dict:
+        msg_type, data = self.send_command(GETHARDWAREINFO)
+        if msg_type == 21:
+            self.last_error = 21
+            print(f"Error getting hardware info: {errorCodes[msg_type]}")
+            return {}
+        try:
+            parsed = self.parse_payload(data)
+
+            u32    = parsed["uints"]
+            f64    = parsed["doubles"]
+            i32    = parsed["ints"]
+            texts  = parsed["text"]
+
+            # Expected: 1 uint, 7 doubles, 0 ints, 5 text strings
+            if len(u32) != 1 or len(f64) != 7 or len(i32) != 0 or len(texts) != 5:
+                print(
+                    f"Unexpected payload layout: "
+                    f"uints={len(u32)}, doubles={len(f64)}, ints={len(i32)}, text={len(texts)}"
+                )
+                return {}
+            
+            info = {
+                "computername":                texts[0],
+                "processorname":               texts[1],
+                "processorspeed_ghz":          f64[0],
+                "nrofprocessorcores":          u32[0],
+                "tickspeedmhz":                f64[1],
+                "mmxssecapabilities":          texts[2],
+                "totalmemorygb":               f64[2],
+                "freememorygb":                f64[3],
+                "graphicscardname":            texts[3],
+                "graphicsdedicatedvideomemgb": f64[4],
+                "graphicsdedicatedsysmemgb":   f64[5],
+                "graphicssharedsysmemgb":      f64[6],
+                "graphicsrasterizerused":      texts[4],
+            }
+
+            return info
+        except ValueError as e:
+            self.last_error = 2
+            print(f"Failed to parse hardware info response: {data!r}, error: {e}")
+            return {}
+
     ######################################################################
     # 2: getnumberofsegments()
     def get_number_of_segments(self) -> Optional[int]:
