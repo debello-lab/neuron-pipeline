@@ -922,30 +922,54 @@ class SurfaceExtractor:
                                     bbx[5] += 1
                             
                             # Extract subsegment (convert to 0-indexed)
-                            bbx_int = bbx.astype(int) - 1  # MATLAB is 1-indexed
-                            subseg = seg_image[bbx_int[0]:bbx_int[3]+1, bbx_int[1]:bbx_int[4]+1, bbx_int[2]:bbx_int[5]+1]
+                            # seg_image is (X, Y, Z) ordered
+                            # bbx is [xmin, ymin, zmin, xmax, ymax, zmax] (1-indexed)
+                            bbx_int = bbx.astype(int) - 1  # Convert to 0-indexed
+                            subseg = seg_image[bbx_int[0]:bbx_int[3]+1, 
+                                               bbx_int[1]:bbx_int[4]+1, 
+                                               bbx_int[2]:bbx_int[5]+1]
                             subseg = (subseg == seg).astype(float)
 
-                            # Transpose to MATLAB's (Y, X, Z) convention before marching cubes
-                            subseg = np.transpose(subseg, (1, 0, 2))
+                            # Skip if no valid surface can be extracted
+                            if subseg.min() == subseg.max() or np.any(np.array(subseg.shape) < 2):
+                                continue
 
                             # Extract isosurface using marching cubes
+                            # NOTE: Do NOT transpose - seg_image is already (X, Y, Z)
                             try:
                                 verts, faces, normals, values_mc = measure.marching_cubes(subseg, level=0.5)
 
                                 if len(verts) > 0:
-                                    # marching_cubes output is now in (Y, X, Z) order
-                                    # Swap columns 0 and 1 to get back to (X, Y, Z)
+                                    # ================================================
+                                    # CRITICAL: Match MATLAB's coordinate output order
+                                    # ================================================
+                                    # MATLAB isosurface with input V(x,y,z) returns vertices as (Y, X, Z)
+                                    # Python marching_cubes with input V[x,y,z] returns vertices as (X, Y, Z)
+                                    # Swap columns 0 and 1 to convert (X,Y,Z) -> (Y,X,Z) like MATLAB
                                     verts[:, [0, 1]] = verts[:, [1, 0]]
-
-                                    # Adjust coordinates for bounding box offset (now in X, Y, Z order)
-                                    verts[:, 0] += bbx_int[0] + x_vofs  # X offset
-                                    verts[:, 1] += bbx_int[1] + y_vofs  # Y offset
+                                    
+                                    # Reverse face winding to maintain correct normals after the swap
+                                    faces = faces[:, [0, 2, 1]]
+                                    
+                                    # ================================================
+                                    # Apply offsets - matching MATLAB exactly
+                                    # ================================================
+                                    # After swap: verts[:,0]=Y, verts[:,1]=X, verts[:,2]=Z
+                                    
+                                    # MATLAB code:
+                                    #   v(:,1)=v(:,1)+bbx(2)-1+yvofs;  % v(:,1) is Y, bbx(2) is ymin
+                                    #   v(:,2)=v(:,2)+bbx(1)-1+xvofs;  % v(:,2) is X, bbx(1) is xmin
+                                    #   v(:,3)=v(:,3)+bbx(3)-1+zvofs;  % v(:,3) is Z
+                                    # bbx_int is 0-indexed, so bbx(2)-1 in MATLAB = bbx_int[1] in Python
+                                    verts[:, 0] += bbx_int[1] + y_vofs  # Y offset (column 0 after swap)
+                                    verts[:, 1] += bbx_int[0] + x_vofs  # X offset (column 1 after swap)
                                     verts[:, 2] += bbx_int[2] + z_vofs  # Z offset
 
-                                    # Adjust for tile position
-                                    verts[:, 0] += tile_x1  # X tile position
-                                    verts[:, 1] += tile_y1  # Y tile position
+                                    # Add tile position
+                                    # MATLAB: v(:,1)=v(:,1)+tiley1-1;  v(:,2)=v(:,2)+tilex1-1;
+                                    # tile coords in Python are 0-indexed already
+                                    verts[:, 0] += tile_y1  # Y (column 0)
+                                    verts[:, 1] += tile_x1  # X (column 1)
 
                                     if slice_step == 1:
                                         verts[:, 2] += tile_z1
@@ -953,17 +977,19 @@ class SurfaceExtractor:
                                         verts[:, 2] = ((verts[:, 2] - 0.5) * slice_step) + 0.5 + first_block_slice
 
                                     # Scale to physical units
-                                    verts[:, 0] *= param.get('xscale', 1.0) * param.get('xunit', 1.0) * param['mipfactx']
-                                    verts[:, 1] *= param.get('yscale', 1.0) * param.get('yunit', 1.0) * param['mipfacty']
-                                    verts[:, 2] *= param.get('zscale', 1.0) * param.get('zunit', 1.0) * param['mipfactz']
+                                    # MATLAB: v(:,1)*yscale*yunit*mipfacty (Y)
+                                    #         v(:,2)*xscale*xunit*mipfactx (X)
+                                    verts[:, 0] *= param.get('yscale', 1.0) * param.get('yunit', 1.0) * param['mipfacty']  # Y
+                                    verts[:, 1] *= param.get('xscale', 1.0) * param.get('xunit', 1.0) * param['mipfactx']  # X
+                                    verts[:, 2] *= param.get('zscale', 1.0) * param.get('zunit', 1.0) * param['mipfactz']  # Z
 
                                     # Track volume for this segment
-                                    voxel_count = int(np.sum(subseg))
+                                    voxel_count = int(np.sum(subseg > 0))
                                     obj_idx = np.where(param['objects'][:, 0] == int(seg))[0]
                                     if len(obj_idx) > 0:
                                         param['object_volume'][obj_idx[0]] += voxel_count
 
-                                    # Store faces and vertices (convert faces to 1-indexed for OBJ format later)
+                                    # Store faces and vertices
                                     param['farray'][(int(seg), tx, ty, tz)] = faces
                                     param['varray'][(int(seg), tx, ty, tz)] = verts
                                     
@@ -1084,25 +1110,29 @@ class SurfaceExtractor:
                                     # All zeros or all ones - skip
                                     continue
 
-                                # Transpose to MATLAB's (Y, X, Z) convention before marching cubes
-                                subseg = np.transpose(subseg, (1, 0, 2))
+                                # NOTE: Do NOT transpose - col_cube is already (X, Y, Z)
 
                                 # Extract isosurface
                                 try:
                                     verts, faces, normals, values_mc = measure.marching_cubes(subseg, level=0.5)
 
                                     if len(verts) > 0:
-                                        # marching_cubes output is now in (Y, X, Z) order
-                                        # Swap columns 0 and 1 to get back to (X, Y, Z)
+                                        # ================================================
+                                        # CRITICAL: Match MATLAB's coordinate output order
+                                        # ================================================
+                                        # Swap columns 0 and 1 to convert (X,Y,Z) -> (Y,X,Z) like MATLAB
                                         verts[:, [0, 1]] = verts[:, [1, 0]]
+                                        
+                                        # Reverse face winding to maintain correct normals
+                                        faces = faces[:, [0, 2, 1]]
 
-                                        # Adjust coordinates (X, Y, Z)
-                                        verts[:, 0] += x_vofs
-                                        verts[:, 1] += y_vofs
-                                        verts[:, 2] += z_vofs
+                                        # After swap: verts[:,0]=Y, verts[:,1]=X, verts[:,2]=Z
+                                        verts[:, 0] += y_vofs  # Y offset
+                                        verts[:, 1] += x_vofs  # X offset
+                                        verts[:, 2] += z_vofs  # Z offset
 
-                                        verts[:, 0] += tile_x1
-                                        verts[:, 1] += tile_y1
+                                        verts[:, 0] += tile_y1  # Y
+                                        verts[:, 1] += tile_x1  # X
 
                                         if slice_step == 1:
                                             verts[:, 2] += tile_z1
@@ -1110,9 +1140,10 @@ class SurfaceExtractor:
                                             verts[:, 2] = ((verts[:, 2] - 0.5) * slice_step) + 0.5 + first_block_slice
 
                                         # Scale to physical units
-                                        verts[:, 0] *= param.get('xscale', 1.0) * param.get('xunit', 1.0) * param['mipfactx']
-                                        verts[:, 1] *= param.get('yscale', 1.0) * param.get('yunit', 1.0) * param['mipfacty']
-                                        verts[:, 2] *= param.get('zscale', 1.0) * param.get('zunit', 1.0) * param['mipfactz']
+                                        # verts[:,0] is Y, verts[:,1] is X
+                                        verts[:, 0] *= param.get('yscale', 1.0) * param.get('yunit', 1.0) * param['mipfacty']  # Y
+                                        verts[:, 1] *= param.get('xscale', 1.0) * param.get('xunit', 1.0) * param['mipfactx']  # X
+                                        verts[:, 2] *= param.get('zscale', 1.0) * param.get('zunit', 1.0) * param['mipfactz']  # Z
 
                                         # Store with block indexing
                                         idx = tz * param['nr_y_tiles'] * param['nr_x_tiles'] + ty * param['nr_x_tiles'] + tx
@@ -1158,25 +1189,29 @@ class SurfaceExtractor:
                                 if subseg.ndim != 3:
                                     continue
 
-                                # Transpose to MATLAB's (Y, X, Z) convention before marching cubes
-                                subseg = np.transpose(subseg, (1, 0, 2))
+                                # NOTE: Do NOT transpose - cube data is already (X, Y, Z)
 
                                 # Extract isosurface
                                 try:
                                     verts, faces, normals, values_mc = measure.marching_cubes(subseg, level=0.5)
 
                                     if len(verts) > 0:
-                                        # marching_cubes output is now in (Y, X, Z) order
-                                        # Swap columns 0 and 1 to get back to (X, Y, Z)
+                                        # ================================================
+                                        # CRITICAL: Match MATLAB's coordinate output order
+                                        # ================================================
+                                        # Swap columns 0 and 1 to convert (X,Y,Z) -> (Y,X,Z) like MATLAB
                                         verts[:, [0, 1]] = verts[:, [1, 0]]
+                                        
+                                        # Reverse face winding to maintain correct normals
+                                        faces = faces[:, [0, 2, 1]]
 
-                                        # Adjust coordinates (X, Y, Z)
-                                        verts[:, 0] += x_vofs
-                                        verts[:, 1] += y_vofs
-                                        verts[:, 2] += z_vofs
+                                        # After swap: verts[:,0]=Y, verts[:,1]=X, verts[:,2]=Z
+                                        verts[:, 0] += y_vofs  # Y offset
+                                        verts[:, 1] += x_vofs  # X offset
+                                        verts[:, 2] += z_vofs  # Z offset
 
-                                        verts[:, 0] += tile_x1
-                                        verts[:, 1] += tile_y1
+                                        verts[:, 0] += tile_y1  # Y
+                                        verts[:, 1] += tile_x1  # X
 
                                         if slice_step == 1:
                                             verts[:, 2] += tile_z1
@@ -1184,9 +1219,10 @@ class SurfaceExtractor:
                                             verts[:, 2] = ((verts[:, 2] - 0.5) * slice_step) + 0.5 + first_block_slice
 
                                         # Scale to physical units
-                                        verts[:, 0] *= param.get('xscale', 1.0) * param.get('xunit', 1.0) * param['mipfactx']
-                                        verts[:, 1] *= param.get('yscale', 1.0) * param.get('yunit', 1.0) * param['mipfacty']
-                                        verts[:, 2] *= param.get('zscale', 1.0) * param.get('zunit', 1.0) * param['mipfactz']
+                                        # verts[:,0] is Y, verts[:,1] is X
+                                        verts[:, 0] *= param.get('yscale', 1.0) * param.get('yunit', 1.0) * param['mipfacty']  # Y
+                                        verts[:, 1] *= param.get('xscale', 1.0) * param.get('xunit', 1.0) * param['mipfactx']  # X
+                                        verts[:, 2] *= param.get('zscale', 1.0) * param.get('zunit', 1.0) * param['mipfactz']  # Z
 
                                         # Store faces and vertices
                                         param['farray'][(obj_idx, tx, ty, tz)] = faces
@@ -1787,69 +1823,45 @@ def main():
         return
     vast.disconnect()
 
-    region_params = {
-    'xmin': 0,
-    'xmax': info['datasizex'] - 1,
-    'ymin': 0,
-    'ymax': info['datasizey'] - 1,
-    'zmin': 0,
-    'zmax': info['datasizez'] - 1,
-    }
-
-    export_params = {     
-        # Mip level and sampling
-        'miplevel': 2,  # 0=full res, higher=lower res
-        'slicestep': 1,  # Use every nth slice
-        
-        # Mip region constraint (optional)
-        'usemipregionconstraint': False,
-        'mipregionmip': info['nrofmiplevels'] - 1,
-        'mipregionpadding': 1,
-        
-        # Processing block size (use reasonable sizes that work at any mip level)
-        'blocksizex': 512,
-        'blocksizey': 512,
+    export_params = {
+        'miplevel': 1,           # Use mip level 2 for faster testing
+        'extractwhich': 1,       # Selected segment and children, uncollapsed
+        'blocksizex': 128,
+        'blocksizey': 128,
         'blocksizez': 64,
         'overlap': 1,
-        
-        # Scaling and units
+        'slicestep': 1,
+        'xunit': 5.0,            # Voxel size in nm
+        'yunit': 5.0,
+        'zunit': 50.0,
         'xscale': 0.001,
         'yscale': 0.001,
         'zscale': 0.001,
-        'xunit': info['voxelsizex'],  # nm
-        'yunit': info['voxelsizey'],
-        'zunit': info['voxelsizez'],
-        
-        # Output offset
+        'targetfolder': './test_output_meshes/',
+        'targetfileprefix': 'test_',
+        'fileformat': 1,         # 1 = OBJ
+        'closesurfaces': 1,
+        'invertz': 0,
+        'includefoldernames': 0,
+        'disablenetwarnings': 0,
+        'erodedilate': 0,
+        'usemipregionconstraint': 0,
         'outputoffsetx': 0,
-        'outputoffsety': 0,
+        'outputoffsety': 0, 
         'outputoffsetz': 0,
-        
-        # Options
-        'invertz': True,
-        'erodedilate': False,
-        'closesurfaces': True,
-        
-        # Export mode
-        'extractwhich': 3,  # 1=all segments uncollapsed, 2=collapsed, 
-                           # 3=selected+children uncollapsed, 4=selected+children collapsed
-                           # 5=RGB isosurfaces, 6=brightness isosurface, 
-                           # 7/8/9=multi-level brightness, 10=one per color
-        
-        # File output
-        'targetfileprefix': 'Segment_',
-        'targetfolder': './vast_export',
-        'fileformat': 1,  # 1=OBJ/MTL, 2=PLY
-        'includefoldernames': True,
-        'objectcolors': 1,  # 1=VAST colors, 2=volume-based colormap
-        'max_object_number': 1000000,
-        
-        # Advanced
-        'skipmodelgeneration': False,
-        'disablenetwarnings': True,
-        'write3dsmaxloader': False,
-        'savesurfacestats': False,
-        'surfacestatsfile': 'surfacestats.txt',
+        'objectcolors': 1,       # Use VAST colors
+    }
+    
+    # Small region for testing
+    # Note: At mip level 2, these coordinates will be divided by 4
+    # So these full-res coordinates become [250-377, 250-377, 0-20] at mip 2
+    region_params = {
+        'xmin': 0,
+        'xmax': 2713,
+        'ymin': 0,
+        'ymax': 2713,
+        'zmin': 0,
+        'zmax': 119,
     }
     extractor = SurfaceExtractor(vast, export_params, region_params)
 
@@ -1877,4 +1889,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
