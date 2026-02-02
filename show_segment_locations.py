@@ -44,9 +44,9 @@ def show_segment_locations():
         seg_id = int(row[0])
         name = names[i] if names and i < len(names) else f"Segment_{seg_id}"
 
-        minx, maxx = int(row[18]), int(row[19])
-        miny, maxy = int(row[20]), int(row[21])
-        minz, maxz = int(row[22]), int(row[23])
+        minx, maxx = int(row[18]), int(row[21])
+        miny, maxy = int(row[19]), int(row[22])
+        minz, maxz = int(row[20]), int(row[23])
 
         print(f"\n{i+1}. {name} (ID={seg_id}):")
         print(f"   X: [{minx:5d} - {maxx:5d}]  (width: {maxx-minx:5d})")
