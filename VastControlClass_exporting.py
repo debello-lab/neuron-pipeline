@@ -913,11 +913,126 @@ class VASTControlClass:
 
 
 
+    def execute_canvas_paint_stroke(self, coords: np.ndarray) -> bool:
+        """
+        Execute a canvas paint stroke with the given coordinates.
+        
+        Args:
+            coords: NumPy array of shape (n, 2) representing (x, y) mouse coordinates in window.
+        
+        Returns:
+            True on success, False on failure.
+        """
+        # Ensure coords is a 2D array
+        coords = np.atleast_2d(coords)
+        
+        if coords.shape[1] != 2:
+            self.last_error = 50  # Invalid input
+            return False
+        
+        # Transpose and flatten to get column-major order like MATLAB
+        c2 = coords.T.flatten(order='F')
+        
+        # Convert to uint32 and create data payload
+        coords_uint32 = c2.astype(np.uint32)
+        mdata = self.bytes_from_data(coords_uint32)
+        
+        # Send dimensions (rows, cols) followed by coordinate data
+        dims = self.bytes_from_uint32([coords.shape[0], coords.shape[1]])
+        payload = dims + mdata
+        
+        msg_type, data = self.send_command(self.EXECUTECANVASPAINTSTROKE, payload)
+        
+        if msg_type != 1:
+            self.last_error = msg_type
+            return False
+        
+        parsed = self.parse_payload(data)
+        self.last_error = 0
+        return True
+
+    def set_selected_segment_nr(self, segment_nr: int) -> bool:
+        """
+        Set the currently selected segment number.
+        
+        Args:
+            segment_nr: The segment number to select.
+        
+        Returns:
+            True on success, False on failure.
+        """
+        payload = self.bytes_from_int32(segment_nr)
+        msg_type, data = self.send_command(self.SETSELECTEDSEGMENTNR, payload)
+        
+        if msg_type != 1:
+            self.last_error = msg_type
+            return False
+        
+        parsed = self.parse_payload(data)
+        self.last_error = 0
+        return True
 
 
-
+    def get_first_segment_nr(self) -> int:
+        """
+        Get the first segment number.
+        
+        Returns:
+            First segment number, or -1 on failure.
+        """
+        msg_type, data = self.send_command(self.GETFIRSTSEGMENTNR)
+        
+        if msg_type != 1:
+            self.last_error = msg_type
+            return -1
+        
+        parsed = self.parse_payload(data)
+        
+        if len(parsed["uints"]) == 1:
+            self.last_error = 0
+            return parsed["uints"][0]
+        else:
+            self.last_error = 2  # unexpected data
+            return -1
     
-    
+    def set_anchor_point(self, segment_id: int, x: int, y: int, z: int) -> bool:
+        """
+        Set the anchor point of a segment.
+
+        Args:
+            segment_id: Segment ID
+            x, y, z: Anchor coordinates in voxels (full resolution, non-negative)
+
+        Returns:
+            True on success, False on failure
+        """
+        payload = self.bytes_from_uint32(segment_id) + \
+                self.bytes_from_uint32(x) + \
+                self.bytes_from_uint32(y) + \
+                self.bytes_from_uint32(z)
+
+        msg_type, data = self.send_command(self.SETANCHORPOINT, payload)
+
+        success = (msg_type == 1)
+        self.last_error = 0 if success else msg_type
+        return success
+
+
+    def set_view_coordinates(self, x: int, y: int, z: int) -> bool:
+        """
+        Set the view coordinates.
+        
+        Args:
+            x, y, z: View coordinates in voxels (full resolution, non-negative)
+        
+        Returns:
+            True on success, False on failure.
+        """
+        payload = self.bytes_from_uint32(x) + self.bytes_from_uint32(y) + self.bytes_from_uint32(z)
+        msg_type, data = self.send_command(self.SETVIEWCOORDINATES, payload)
+        success = (msg_type == 1)
+        self.last_error = 0 if success else msg_type
+        return success
 
     def send_command(self, msg_id: int, payload: bytes = b"") -> Tuple[int, bytes]:
         """

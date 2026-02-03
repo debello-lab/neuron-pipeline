@@ -624,6 +624,123 @@ def test_parse_payload():
 
     return True
 
+import numpy as np
+import math
+
+def draw_circle(api, center_x: int, center_y: int, radius: int, num_points: int = 360):
+    """Draw one circle outline."""
+    if radius <= 0:
+        return True
+
+    # Choose points proportional to circumference; clamp to a sane minimum
+    if num_points is None:
+        num_points = max(24, int(2 * math.pi * radius))  # ~1 point per pixel around
+
+    angles = np.linspace(0, 2 * np.pi, num_points, endpoint=False)
+    x = center_x + radius * np.cos(angles)
+    y = center_y + radius * np.sin(angles)
+    coords = np.column_stack((x, y)).astype(np.int32)
+    return api.execute_canvas_paint_stroke(coords)
+
+def draw_filled_circle(api, center_x: int, center_y: int, radius: int, ring_step: int = 4):
+    """
+    Fill a circle by drawing concentric rings.
+    ring_step should roughly match brush diameter in pixels (or slightly smaller).
+    """
+    if radius <= 0:
+        return True
+
+    # Draw from outside in (often looks cleaner)
+    for r in range(radius, 0, -ring_step):
+        ok = draw_circle(api, center_x, center_y, r)
+        if not ok:
+            return False
+
+    # Optional: dot the center (sometimes a tiny hole remains)
+    return draw_circle(api, center_x, center_y, 1, num_points=12)
+
+import math
+
+def draw_filled_sphere(api, center_x: int, center_y: int, radius: int,
+                               top_z: int = 0, z_step: int = 1, ring_step: int = 4):
+    """
+    Draw a filled sphere where the TOP slice is at top_z (default 0),
+    and we move forward by INCREASING z.
+    """
+    info = api.get_info()
+    if info is None:
+        return False
+
+    x0 = int(info["currentviewx"])
+    y0 = int(info["currentviewy"])
+
+    # Put the sphere center radius slices below the top
+    center_z = top_z + radius
+
+    # Sweep z only upward (never negative)
+    z_start = top_z
+    z_end = top_z + 2 * radius
+
+    for z in range(z_start, z_end + 1, z_step):
+        dz = z - center_z
+        r_slice = int(round(math.sqrt(max(0, radius * radius - dz * dz))))
+
+        api.set_view_coordinates(x0, y0, z)
+
+        ok = draw_filled_circle(api, center_x, center_y, r_slice, ring_step=ring_step)
+        if not ok:
+            return False
+
+    return True
+
+
+def test_draw_filled_sphere(vast):
+    """Test draw_filled_sphere() - draws a filled sphere (stacked circles across z) on segmentation."""
+
+    print("\n=== Test: draw_filled_sphere() ===")
+
+    # Get the first segment number
+    first_seg = vast.get_first_segment_nr()
+    if first_seg == -1:
+        print(f"  Failed to get first segment number. Error: {vast.get_last_error()}")
+        return False
+    print(f"  First segment number: {first_seg}")
+
+    # Set the selected segment to the first segment
+    success = vast.set_selected_segment_nr(first_seg)
+    if not success:
+        print(f"  Failed to set selected segment. Error: {vast.get_last_error()}")
+        return False
+    print(f"  Selected segment set to: {first_seg}")
+
+    # Get current view position to draw near the center of the view
+    info = vast.get_info()
+    if info is None:
+        print(f"  Failed to get info. Error: {vast.get_last_error()}")
+        return False
+
+    # Use window coordinates - draw in center of a typical window
+    # These are screen/window coordinates, not dataset coordinates
+    center_x = 775
+    center_y = 475
+    radius = 50
+    info = vast.get_info()
+    vast.set_view_coordinates(info["currentviewx"], info["currentviewy"], info["currentviewz"])
+
+    print(f"  Drawing filled sphere at window position ({center_x}, {center_y}) with radius {radius}")
+    print(f"  Current view in dataset: ({info['currentviewx']}, {info['currentviewy']}, {info['currentviewz']})")
+
+    # Draw the filled sphere
+    success = draw_filled_sphere(vast, center_x, center_y, radius, top_z=0, z_step=5, ring_step=10)
+    vast.set_view_coordinates(info["currentviewx"], info["currentviewy"], info["currentviewz"])
+
+    if success:
+        print(f"  Successfully drew filled sphere with segment {first_seg}")
+    else:
+        print(f"  Failed to draw filled sphere. Error: {vast.get_last_error()}")
+
+    return success
+
 
 def run_all_tests():
     """Run all tests."""
@@ -692,6 +809,9 @@ def run_all_tests():
 
         # Error popup tests
         test_set_error_popups_enabled(vast)
+
+        # Drawing tests (paint stroke on segmentation layer)
+        test_draw_filled_sphere(vast)
 
         print("\n" + "=" * 60)
         print("All tests passed!")
