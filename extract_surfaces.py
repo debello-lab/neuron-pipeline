@@ -1,6 +1,6 @@
 """
 Production Surface Extraction for VAST Segmentation Data
-Master's Project - Neural Reconstruction Pipeline
+Neural Reconstruction Pipeline
 
 This module extracts 3D surface meshes from individual segments in VAST datasets.
 Designed for neurons ranging from thousands to tens of millions of voxels.
@@ -112,6 +112,11 @@ class SegmentSurfaceExtractor:
             self.mip_factors = None
             self.logger.warning("Could not retrieve MIP scale factors")
     
+    def _set_socket_timeout(self, timeout_seconds):
+        """Temporarily change socket timeout for large data transfers."""
+        if self.vast.client_socket:
+            self.vast.client_socket.settimeout(timeout_seconds)
+
     def get_segment_metadata(self, segment_id: int) -> Optional[Dict[str, Any]]:
         """
         Retrieve metadata for a segment.
@@ -324,14 +329,21 @@ class SegmentSurfaceExtractor:
             minz = minz // mip_scale[2]
             maxz = maxz // mip_scale[2]
         
-        # Add padding for marching cubes
+        mip_scale_val = mip_scale if isinstance(mip_scale, list) else [1, 1, 1]
+        max_x_bound = (self.dataset_info['datasizex'] >> miplevel) - 1
+        max_y_bound = (self.dataset_info['datasizey'] >> miplevel) - 1
+        max_z_bound = self.dataset_info['datasizez'] - 1
+        if miplevel > 0 and mip_scale_val[2] != 1:
+            max_z_bound = max_z_bound // mip_scale_val[2]
+
+        # Add padding for marching cubes, clamped to dataset bounds
         padding = 2 if close_surfaces else 1
         minx = max(0, minx - padding)
         miny = max(0, miny - padding)
         minz = max(0, minz - padding)
-        maxx = maxx + padding
-        maxy = maxy + padding
-        maxz = maxz + padding
+        maxx = min(max_x_bound, maxx + padding)  # CLAMP
+        maxy = min(max_y_bound, maxy + padding)  # CLAMP
+        maxz = min(max_z_bound, maxz + padding)  # CLAMP
         
         self.logger.info(f"Loading volume at MIP {miplevel}")
         self.logger.info(f"  Region: X=[{minx},{maxx}] Y=[{miny},{maxy}] Z=[{minz},{maxz}]")
@@ -340,6 +352,12 @@ class SegmentSurfaceExtractor:
         self.vast.set_seg_translation([segment_id], [segment_id])
         
         # Load segmentation data
+        # Increase timeout for large transfers (estimate: 1 second per 10M voxels)
+        volume_size = (maxx - minx + 1) * (maxy - miny + 1) * (maxz - minz + 1)
+        estimated_timeout = max(60, int(volume_size / 10_000_000) * 10)  # At least 60 seconds
+        self.logger.debug(f"Setting socket timeout to {estimated_timeout}s for {volume_size:,} voxel request")
+        self._set_socket_timeout(estimated_timeout)
+
         try:
             seg_image = self.vast.get_seg_image_rle_decoded(
                 miplevel, minx, maxx, miny, maxy, minz, maxz,
@@ -348,6 +366,8 @@ class SegmentSurfaceExtractor:
         finally:
             # Always clear translation
             self.vast.set_seg_translation([], [])
+            # Reset to default timeout
+            self._set_socket_timeout(10)
         
         if seg_image is None:
             self.logger.error("Failed to load segmentation data from VAST")
@@ -424,7 +444,7 @@ class SegmentSurfaceExtractor:
         # Convert to micrometers (assuming voxel_size is in nm)
         if voxel_size[0] > 1:  # Likely nanometers
             verts *= 0.001
-            self.logger.debug("Converted coordinates from nm to μm")
+            self.logger.debug("Converted coordinates from nm to um")
         
         return verts, faces
     
@@ -578,7 +598,7 @@ def main():
     
     try:
         # Create extractor
-        extractor = SegmentSurfaceExtractor(vast, output_dir="./vast_output")
+        extractor = SegmentSurfaceExtractor(vast, output_dir="./vast_export")
         
         # Example: Extract segment 1
         segment_id = 1
@@ -589,7 +609,7 @@ def main():
         vertices, faces, output_path = extractor.extract_segment(
             segment_id=segment_id,
             miplevel=0,  # Full resolution
-            close_surfaces=True,
+            close_surfaces=False,
             output_format='obj'
         )
         
@@ -600,10 +620,7 @@ def main():
             print(f"Mesh saved to: {output_path}")
             print(f"Vertices: {len(vertices):,}")
             print(f"Faces: {len(faces):,}")
-            print("\nNext steps:")
-            print("  1. View mesh in MeshLab or Blender")
-            print("  2. Verify morphological features are preserved")
-            print("  3. Proceed to skeletonization pipeline")
+
         else:
             print("\nExtraction failed - check logs for details")
             
