@@ -1,5 +1,6 @@
 from VastControlClass_exporting import VASTControlClass
 import numpy as np
+import math
 
 # Connection parameters
 HOST = '127.0.0.1'
@@ -624,8 +625,7 @@ def test_parse_payload():
 
     return True
 
-import numpy as np
-import math
+
 
 def draw_circle(api, center_x: int, center_y: int, radius: int, num_points: int = 360):
     """Draw one circle outline."""
@@ -659,8 +659,6 @@ def draw_filled_circle(api, center_x: int, center_y: int, radius: int, ring_step
     # Optional: dot the center (sometimes a tiny hole remains)
     return draw_circle(api, center_x, center_y, 1, num_points=12)
 
-import math
-
 def draw_filled_sphere(api, center_x: int, center_y: int, radius: int,
                                top_z: int = 0, z_step: int = 1, ring_step: int = 4):
     """
@@ -692,7 +690,6 @@ def draw_filled_sphere(api, center_x: int, center_y: int, radius: int,
             return False
 
     return True
-
 
 def test_draw_filled_sphere(vast):
     """Test draw_filled_sphere() - draws a filled sphere (stacked circles across z) on segmentation."""
@@ -738,6 +735,134 @@ def test_draw_filled_sphere(vast):
         print(f"  Successfully drew filled sphere with segment {first_seg}")
     else:
         print(f"  Failed to draw filled sphere. Error: {vast.get_last_error()}")
+
+    return success
+
+def draw_sphere_3d(api, center_x: int, center_y: int, start_z: int, max_radius: int,
+                   radius_step: int = 5, ring_step: int = 4):
+    """
+    Draw a 3D sphere by incrementing Z and growing circle radius, then decrementing.
+    Uses set_drawing_properties to adjust paint cursor diameter for each slice.
+
+    Args:
+        api: VAST API instance
+        center_x: X window coordinate of sphere center
+        center_y: Y window coordinate of sphere center
+        start_z: Starting Z coordinate in dataset
+        max_radius: Maximum radius at the sphere's equator
+        radius_step: How much to change radius per Z slice (default 5)
+        ring_step: Step for filling circles (default 4)
+
+    Returns:
+        True on success, False on failure
+    """
+    # Get current view to preserve x, y
+    info = api.get_info()
+    if info is None:
+        return False
+
+    view_x = int(info["currentviewx"])
+    view_y = int(info["currentviewy"])
+
+    # Phase 1: Increment Z while growing radius (from radius_step to max_radius)
+    current_z = start_z
+    radii_up = list(range(radius_step, max_radius + 1, radius_step))
+
+    print(f"    Phase 1: Growing circles (z={start_z} to z={start_z + len(radii_up) - 1})")
+    for i, radius in enumerate(radii_up):
+        # Set view coordinates for this Z slice
+        api.set_view_coordinates(view_x, view_y, current_z)
+
+        # Set paint cursor diameter to match the circle radius
+        api.set_drawing_properties({"paintcursordiameter": max(1, radius // 2)})
+
+        print(f"      Z={current_z}, radius={radius}")
+        draw_filled_circle(api, center_x, center_y, radius, ring_step=ring_step)
+        current_z += 1
+
+    # Phase 2: Continue incrementing Z while shrinking radius (from max_radius-step down to radius_step)
+    radii_down = list(range(max_radius - radius_step, 0, -radius_step))
+
+    print(f"    Phase 2: Shrinking circles (z={current_z} to z={current_z + len(radii_down) - 1})")
+    for i, radius in enumerate(radii_down):
+        # Set view coordinates for this Z slice
+        api.set_view_coordinates(view_x, view_y, current_z)
+
+        # Set paint cursor diameter to match the circle radius
+        api.set_drawing_properties({"paintcursordiameter": max(1, radius // 2)})
+
+        print(f"      Z={current_z}, radius={radius}")
+        draw_filled_circle(api, center_x, center_y, radius, ring_step=ring_step)
+        draw_filled_circle(api, center_x, center_y, radius, ring_step=ring_step)
+        current_z += 1
+
+    return True
+
+
+def test_draw_sphere_3d(vast):
+    """Test draw_sphere_3d() - draws a 3D sphere by varying Z and circle radius."""
+    print("\n=== Test: draw_sphere_3d() ===")
+
+    # Get the first segment number
+    first_seg = vast.get_first_segment_nr()
+    if first_seg == -1:
+        print(f"  Failed to get first segment number. Error: {vast.get_last_error()}")
+        return False
+    print(f"  First segment number: {first_seg}")
+
+    # Set the selected segment to the first segment
+    success = vast.set_selected_segment_nr(first_seg)
+    if not success:
+        print(f"  Failed to set selected segment. Error: {vast.get_last_error()}")
+        return False
+    print(f"  Selected segment set to: {first_seg}")
+
+    # Get current view position
+    info = vast.get_info()
+    if info is None:
+        print(f"  Failed to get info. Error: {vast.get_last_error()}")
+        return False
+
+    # Store original view to restore later
+    original_x = int(info['currentviewx'])
+    original_y = int(info['currentviewy'])
+    original_z = int(info['currentviewz'])
+
+    # Get and display current drawing properties
+    draw_props = vast.get_drawing_properties()
+    if draw_props:
+        original_cursor_diameter = draw_props.get('paintcursordiameter', 10)
+        print(f"  Original paint cursor diameter: {original_cursor_diameter}")
+    else:
+        original_cursor_diameter = 10
+
+    # Window coordinates for drawing (center of typical window)
+    center_x = 570
+    center_y = 320
+
+    # Sphere parameters
+    max_radius = 50  # Maximum radius at equator
+    radius_step = 2  # Increment/decrement radius by 5
+    start_z = original_z  # Start at current Z
+
+    print(f"  Drawing 3D sphere at window ({center_x}, {center_y})")
+    print(f"  Starting Z: {start_z}, Max radius: {max_radius}, Radius step: {radius_step}")
+    print(f"  Current view in dataset: ({original_x}, {original_y}, {original_z})")
+
+    # Draw the 3D sphere
+    success = draw_sphere_3d(vast, center_x, center_y, start_z, max_radius,
+                             radius_step=radius_step, ring_step=4)
+
+    # Restore original view and drawing properties
+    vast.set_view_coordinates(original_x, original_y, original_z)
+    vast.set_drawing_properties({"paintcursordiameter": original_cursor_diameter})
+    print(f"  Restored view to: ({original_x}, {original_y}, {original_z})")
+    print(f"  Restored paint cursor diameter to: {original_cursor_diameter}")
+
+    if success:
+        print(f"  Successfully drew 3D sphere with segment {first_seg}")
+    else:
+        print(f"  Failed to draw 3D sphere. Error: {vast.get_last_error()}")
 
     return success
 
@@ -811,7 +936,7 @@ def run_all_tests():
         test_set_error_popups_enabled(vast)
 
         # Drawing tests (paint stroke on segmentation layer)
-        test_draw_filled_sphere(vast)
+        test_draw_sphere_3d(vast)
 
         print("\n" + "=" * 60)
         print("All tests passed!")

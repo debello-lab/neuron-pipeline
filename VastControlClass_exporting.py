@@ -910,7 +910,9 @@ class VASTControlClass:
         return mipscalematrix[1:, :]
 
 
-
+##########################################################################
+# Drawing properties
+##########################################################################
 
 
     def execute_canvas_paint_stroke(self, coords: np.ndarray) -> bool:
@@ -972,7 +974,6 @@ class VASTControlClass:
         self.last_error = 0
         return True
 
-
     def get_first_segment_nr(self) -> int:
         """
         Get the first segment number.
@@ -1017,6 +1018,142 @@ class VASTControlClass:
         self.last_error = 0 if success else msg_type
         return success
 
+    def set_view_coordinates(self, x: int, y: int, z: int) -> bool:
+        """
+        Set the view coordinates (all coordinates in pixels at mip0).
+        
+        Args:
+            x: X coordinate in pixels.
+            y: Y coordinate in pixels.
+        z: Z coordinate in pixels.
+    
+        Returns:
+            True on success, False on failure.
+        """
+        payload = self.bytes_from_uint32([x, y, z])
+        msg_type, data = self.send_command(self.SETVIEWCOORDINATES, payload)
+        
+        if msg_type != 1:
+            self.last_error = msg_type
+            return False
+        
+        parsed = self.parse_payload(data)
+        self.last_error = 0
+        return True
+
+    def get_drawing_properties(self) -> Optional[Dict[str, Any]]:
+        """
+        Get current drawing properties.
+        
+        Returns:
+            Dict with drawing properties, or None on failure.
+            Fields: paintcursordiameter, paintcursorlocked, autofill, zscrollenabled,
+                    overwritemode, mippaintrestriction, paintdepth, useconditionalpainting,
+                    cp_contiguousonly, cp_method, cp_sourcelayernr, cp_lowvalue, cp_highvalue
+        """
+        msg_type, data = self.send_command(self.GETDRAWINGPROPERTIES)
+        
+        if msg_type != 1:
+            self.last_error = msg_type
+            return None
+        
+        parsed = self.parse_payload(data)
+        
+        if (len(parsed["uints"]) == 7 and 
+            len(parsed["ints"]) == 1 and 
+            len(parsed["doubles"]) == 2):
+            
+            self.last_error = 0
+            u, i, d = parsed["uints"], parsed["ints"], parsed["doubles"]
+            
+            flags1 = u[1]
+            flags2 = u[4]
+            
+            return {
+                "paintcursordiameter": u[0],
+                "paintcursorlocked": flags1 & 1,
+                "autofill": (flags1 >> 1) & 1,
+                "zscrollenabled": (flags1 >> 2) & 1,
+                "overwritemode": u[2],
+                "mippaintrestriction": i[0],
+                "paintdepth": u[3],
+                "useconditionalpainting": flags2 & 1,
+                "cp_contiguousonly": (flags2 >> 1) & 1,
+                "cp_method": u[5],
+                "cp_sourcelayernr": u[6],
+                "cp_lowvalue": d[0],
+                "cp_highvalue": d[1],
+            }
+        else:
+            self.last_error = 2  # unexpected data
+            return None
+
+    def set_drawing_properties(self, props: Dict[str, Any]) -> bool:
+        """
+        Set drawing properties.
+        
+        Args:
+            props: Dict containing drawing properties to set. Only include fields you want to change.
+                Valid fields: paintcursorlocked, paintcursordiameter, autofill, zscrollenabled,
+                                overwritemode, mippaintrestriction, paintdepth, useconditionalpainting,
+                                cp_contiguousonly, cp_method, cp_sourcelayernr, cp_lowvalue, cp_highvalue
+        
+        Returns:
+            True on success, False on failure.
+        """
+        xflags = 0
+        msg = b""
+        
+        if "paintcursorlocked" in props:
+            msg += self.bytes_from_int32(props["paintcursorlocked"])
+            xflags += 1
+        if "paintcursordiameter" in props:
+            msg += self.bytes_from_uint32(props["paintcursordiameter"])
+            xflags += 2
+        if "autofill" in props:
+            msg += self.bytes_from_int32(props["autofill"])
+            xflags += 4
+        if "zscrollenabled" in props:
+            msg += self.bytes_from_int32(props["zscrollenabled"])
+            xflags += 8
+        if "overwritemode" in props:
+            msg += self.bytes_from_uint32(props["overwritemode"])
+            xflags += 16
+        if "mippaintrestriction" in props:
+            msg += self.bytes_from_int32(props["mippaintrestriction"])
+            xflags += 32
+        if "paintdepth" in props:
+            msg += self.bytes_from_uint32(props["paintdepth"])
+            xflags += 64
+        if "useconditionalpainting" in props:
+            msg += self.bytes_from_int32(props["useconditionalpainting"])
+            xflags += 128
+        if "cp_contiguousonly" in props:
+            msg += self.bytes_from_int32(props["cp_contiguousonly"])
+            xflags += 256
+        if "cp_method" in props:
+            msg += self.bytes_from_uint32(props["cp_method"])
+            xflags += 512
+        if "cp_sourcelayernr" in props:
+            msg += self.bytes_from_int32(props["cp_sourcelayernr"])
+            xflags += 1024
+        if "cp_lowvalue" in props:
+            msg += self.bytes_from_double(props["cp_lowvalue"])
+            xflags += 2048
+        if "cp_highvalue" in props:
+            msg += self.bytes_from_double(props["cp_highvalue"])
+            xflags += 4096
+        
+        payload = self.bytes_from_uint32(xflags) + msg
+        msg_type, data = self.send_command(self.SETDRAWINGPROPERTIES, payload)
+        
+        if msg_type != 1:
+            self.last_error = msg_type
+            return False
+        
+        parsed = self.parse_payload(data)
+        self.last_error = 0
+        return True
 
     def set_view_coordinates(self, x: int, y: int, z: int) -> bool:
         """
@@ -1033,6 +1170,10 @@ class VASTControlClass:
         success = (msg_type == 1)
         self.last_error = 0 if success else msg_type
         return success
+
+##########################################################################
+# Internal methods
+##########################################################################
 
     def send_command(self, msg_id: int, payload: bytes = b"") -> Tuple[int, bytes]:
         """
