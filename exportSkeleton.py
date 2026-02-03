@@ -6,7 +6,7 @@ import re
 from typing import Tuple, List, Dict, Optional
 import time
 import logging
-from VCC import VASTControlClass
+from VastControlClass_exporting import VASTControlClass
 
 class SurfaceExtractor:
     """

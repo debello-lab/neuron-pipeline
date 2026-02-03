@@ -819,6 +819,151 @@ class VASTControlClass:
         self.last_error = 0
         return segimage
 
+    def get_seg_image_rle_decoded_bboxes(
+        self,
+        miplevel: int,
+        minx: int,
+        maxx: int,
+        miny: int,
+        maxy: int,
+        minz: int,
+        maxz: int,
+        surfonlyflag: int = 0,
+        flipflag: int = 0,
+        immediateflag: int = 0,
+        requestloadflag: int = 0
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Get RLE segmentation image, decode it, and compute bounding boxes for each segment.
+        
+        Args:
+            miplevel: MIP level to retrieve.
+            minx, maxx: X range (inclusive).
+            miny, maxy: Y range (inclusive).
+            minz, maxz: Z range (inclusive).
+            surfonlyflag: If 1, get surface-only RLE (default 0).
+            flipflag: If 1, permute dimensions [height, width, depth] (default 0).
+            immediateflag: If 1, use immediate mode (default 0).
+            requestloadflag: Load request flag for immediate mode (default 0).
+        
+        Returns:
+            Dict with keys:
+                'segimage': 3D NumPy array of uint16 values
+                'values': Array of segment IDs that appear in the image
+                'numbers': Array of voxel counts for each segment
+                'bboxes': Array of bounding boxes [xmin, ymin, zmin, xmax, ymax, zmax] for each segment
+            Returns None on failure.
+        """
+        segimage_rle = self.get_seg_image_rle(
+            miplevel, minx, maxx, miny, maxy, minz, maxz,
+            surfonlyflag, immediateflag, requestloadflag
+        )
+        
+        if segimage_rle is None:
+            return None
+        
+        # Get max segment value to allocate arrays
+        if len(segimage_rle) == 0:
+            return {
+                'segimage': np.zeros((maxx-minx+1, maxy-miny+1, maxz-minz+1), dtype=np.uint16),
+                'values': np.array([], dtype=np.uint16),
+                'numbers': np.array([], dtype=np.int32),
+                'bboxes': np.zeros((0, 6), dtype=np.int32)
+            }
+        
+        maxsegval = np.max(segimage_rle[0::2])  # Max of values (even indices)
+        na = np.zeros(maxsegval + 1, dtype=np.int32)
+        bboxes = np.full((maxsegval + 1, 6), -1, dtype=np.int32)
+        
+        # Decode RLE
+        xs = maxx - minx + 1
+        ys = maxy - miny + 1
+        zs = maxz - minz + 1
+        total_size = xs * ys * zs
+        
+        segimage = np.zeros(total_size, dtype=np.uint16)
+        dp = 0  # destination pointer (0-based)
+        x1, y1, z1 = 0, 0, 0  # current position (0-based)
+        
+        # RLE format: [value, count, value, count, ...]
+        for sp in range(0, len(segimage_rle), 2):
+            if sp + 1 >= len(segimage_rle):
+                break
+            
+            val = int(segimage_rle[sp])
+            num = int(segimage_rle[sp + 1])
+            
+            dp2 = dp + num - 1
+            segimage[dp:dp2 + 1] = val
+            na[val] += num
+            
+            # Bounding box computations
+            if (x1 + num) <= xs:
+                # Span fits within current row
+                xmin, xmax = x1, x1 + num - 1
+                ymin, ymax = y1, y1
+                zmin, zmax = z1, z1
+                x1 = x1 + num
+            else:
+                # Span crosses boundaries - compute start and end positions
+                z1_calc = dp // (xs * ys)
+                r = dp - (z1_calc * xs * ys)
+                y1_calc = r // xs
+                x1_calc = r - (y1_calc * xs)
+                
+                z2 = dp2 // (xs * ys)
+                r = dp2 - (z2 * xs * ys)
+                y2 = r // xs
+                x2 = r - (y2 * xs)
+                
+                xmin, xmax = min(x1_calc, x2), max(x1_calc, x2)
+                ymin, ymax = min(y1_calc, y2), max(y1_calc, y2)
+                zmin, zmax = min(z1_calc, z2), max(z1_calc, z2)
+                
+                # If crossing Z planes, extend to full XY
+                if zmax > zmin:
+                    xmin, xmax = 0, xs - 1
+                    ymin, ymax = 0, ys - 1
+                # If crossing Y planes, extend to full X
+                elif ymax > ymin:
+                    xmin, xmax = 0, xs - 1
+                
+                x1, y1, z1 = x2 + 1, y2, z2
+            
+            # Update bounding box for this segment
+            if bboxes[val, 0] == -1:
+                # First occurrence
+                bboxes[val] = [xmin, ymin, zmin, xmax, ymax, zmax]
+            else:
+                # Expand existing bbox
+                bboxes[val, 0] = min(bboxes[val, 0], xmin)
+                bboxes[val, 1] = min(bboxes[val, 1], ymin)
+                bboxes[val, 2] = min(bboxes[val, 2], zmin)
+                bboxes[val, 3] = max(bboxes[val, 3], xmax)
+                bboxes[val, 4] = max(bboxes[val, 4], ymax)
+                bboxes[val, 5] = max(bboxes[val, 5], zmax)
+            
+            dp = dp2 + 1
+        
+        # Extract only segments that appear
+        mask = na > 0
+        values = np.where(mask)[0].astype(np.uint16)
+        numbers = na[mask]
+        bboxes_result = bboxes[mask]
+        
+        # Reshape to 3D (Fortran order for MATLAB compatibility)
+        segimage = segimage.reshape((xs, ys, zs), order='F')
+        
+        if flipflag == 1:
+            segimage = np.transpose(segimage, (1, 0, 2))
+        
+        self.last_error = 0
+        return {
+            'segimage': segimage,
+            'values': values,
+            'numbers': numbers,
+            'bboxes': bboxes_result
+        }
 
     def set_seg_translation(self, sourcearray: Union[List[int], np.ndarray], targetarray: Union[List[int], np.ndarray]) -> bool:
         """
