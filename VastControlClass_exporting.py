@@ -796,18 +796,18 @@ class VASTControlClass:
         total_size = width * height * depth
         
         segimage = np.zeros(total_size, dtype=np.uint16)
-        dp = 0  # destination pointer (0-based in Python)
+        dp = np.int64(0) # destination pointer (0-based in Python)
         
         # RLE format: [value, count, value, count, ...]
         for sp in range(0, len(segimage_rle), 2):
             if sp + 1 >= len(segimage_rle):
                 break
             
-            val = segimage_rle[sp]
-            num = segimage_rle[sp + 1]
+            val = np.uint16(segimage_rle[sp])
+            num = np.int64(segimage_rle[sp + 1])
             
-            segimage[dp:dp + num] = val
-            dp += num
+            segimage[int(dp):int(dp + num)] = val
+            dp = np.int64(dp + num)
         
         # Reshape to 3D array (Fortran order for MATLAB compatibility)
         segimage = segimage.reshape((width, height, depth), order='F')
