@@ -71,7 +71,7 @@ class SegmentSurfaceExtractor:
             self.logger.handlers.clear()
         
         # File handler - detailed logs
-        fh = logging.FileHandler(log_file)
+        fh = logging.FileHandler(log_file, encoding='utf-8')
         fh.setLevel(logging.DEBUG)
         fh_formatter = logging.Formatter(
             '%(asctime)s - %(levelname)s - %(message)s',
@@ -180,6 +180,7 @@ class SegmentSurfaceExtractor:
             bbox_size[2] // mip_scale[2]
         ]
         
+        # TODO: Convert to int64 to avoid possible overflow 
         total_voxels = adj_size[0] * adj_size[1] * adj_size[2]
         
         # Memory estimates (conservative)
@@ -188,8 +189,8 @@ class SegmentSurfaceExtractor:
         # - Marching cubes temporary: ~2x binary volume
         # - Mesh data: highly variable, estimate 100 bytes/surface voxel (conservative)
         
-        seg_data_gb = (total_voxels * 4) / (1024**3)
-        binary_gb = (total_voxels * 4) / (1024**3)
+        seg_data_gb = float(total_voxels * 4) / (1024**3)
+        binary_gb = float(total_voxels * 4) / (1024**3)
         mc_temp_gb = binary_gb * 2
         
         # Estimate surface voxels as ~10% of volume (very rough)
@@ -212,6 +213,336 @@ class SegmentSurfaceExtractor:
         
         return estimates
     
+    def _calculate_block_dimensions(
+        self,
+        bbox_size: list,
+        miplevel: int,
+        max_voxels_per_block: int = None
+        ) -> Tuple[int, int, int]:
+        """
+        Calculate optimal block dimensions for processing.
+        
+        Args:
+            bbox_size: [width, height, depth] of full region
+            miplevel: MIP level
+            max_voxels_per_block: Maximum voxels per block (uses self.max_block_voxels if None)
+            
+        Returns:
+            Tuple of (blocks_x, blocks_y, blocks_z) - number of blocks in each dimension
+        """
+        if max_voxels_per_block is None:
+            max_voxels_per_block = self.max_block_voxels
+        
+        # Adjust size for MIP level
+        mip_scale = [1, 1, 1]
+        if miplevel > 0 and self.mip_factors is not None and miplevel <= len(self.mip_factors):
+            mip_scale = self.mip_factors[miplevel - 1]
+        
+        adj_size = [
+            bbox_size[0] // mip_scale[0],
+            bbox_size[1] // mip_scale[1],
+            bbox_size[2] // mip_scale[2]
+        ]
+        
+        total_voxels = adj_size[0] * adj_size[1] * adj_size[2]
+        
+        # If fits in one block, return 1,1,1
+        if total_voxels <= max_voxels_per_block:
+            return 1, 1, 1
+        
+        # Calculate number of blocks needed
+        # Start with cube root to get balanced splitting
+        blocks_needed = np.ceil(total_voxels / max_voxels_per_block)
+        blocks_per_dim = int(np.ceil(blocks_needed ** (1/3)))
+        
+        # Adjust based on actual dimensions to minimize wasted blocks
+        blocks_x = max(1, int(np.ceil(adj_size[0] / (adj_size[0] / blocks_per_dim))))
+        blocks_y = max(1, int(np.ceil(adj_size[1] / (adj_size[1] / blocks_per_dim))))
+        blocks_z = max(1, int(np.ceil(adj_size[2] / (adj_size[2] / blocks_per_dim))))
+        
+        self.logger.info(f"Block division: {blocks_x} x {blocks_y} x {blocks_z} = {blocks_x*blocks_y*blocks_z} blocks")
+        self.logger.info(f"Average block size: ~{total_voxels/(blocks_x*blocks_y*blocks_z):,.0f} voxels")
+        
+        return blocks_x, blocks_y, blocks_z
+
+    def _merge_meshes(
+        self,
+        verts1: Optional[np.ndarray],
+        faces1: Optional[np.ndarray],
+        verts2: Optional[np.ndarray],
+        faces2: Optional[np.ndarray]
+        ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Merge two meshes into one.
+        
+        Args:
+            verts1, faces1: First mesh (can be None/empty)
+            verts2, faces2: Second mesh (can be None/empty)
+            
+        Returns:
+            Tuple of (merged_vertices, merged_faces)
+        """
+        # Handle empty cases
+        if verts1 is None or len(verts1) == 0:
+            if verts2 is None or len(verts2) == 0:
+                return np.array([]), np.array([])
+            return verts2.copy(), faces2.copy()
+        
+        if verts2 is None or len(verts2) == 0:
+            return verts1.copy(), faces1.copy()
+        
+        # Merge vertices
+        merged_verts = np.vstack([verts1, verts2])
+        
+        # Offset face indices for second mesh
+        offset_faces = faces2 + len(verts1)
+        merged_faces = np.vstack([faces1, offset_faces])
+        
+        return merged_verts, merged_faces
+
+    def _extract_single_block(
+        self,
+        segment_id: int,
+        metadata: Dict[str, Any],
+        miplevel: int,
+        block_bounds: Tuple[int, int, int, int, int, int],
+        global_bounds: Tuple[int, int, int, int, int, int],
+        close_surfaces: bool,
+        mip_scale: list
+        ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """
+        Extract surface for a single block.
+        
+        Args:
+            segment_id: Segment ID
+            metadata: Segment metadata
+            miplevel: MIP level
+            block_bounds: (minx, maxx, miny, maxy, minz, maxz) for this block
+            global_bounds: Dataset bounds for clamping
+            close_surfaces: Whether to close boundaries
+            mip_scale: MIP scale factors
+            
+        Returns:
+            Tuple of (vertices, faces) for this block
+        """
+        minx, maxx, miny, maxy, minz, maxz = block_bounds
+        max_x_bound, max_y_bound, max_z_bound = global_bounds[1], global_bounds[3], global_bounds[5]
+        
+        # Clamp to dataset bounds
+        minx = max(global_bounds[0], minx)
+        maxx = min(max_x_bound, maxx)
+        miny = max(global_bounds[2], miny)
+        maxy = min(max_y_bound, maxy)
+        minz = max(global_bounds[4], minz)
+        maxz = min(max_z_bound, maxz)
+        
+        self.logger.debug(f"  Block region: X=[{minx},{maxx}] Y=[{miny},{maxy}] Z=[{minz},{maxz}]")
+        
+        # Load block data with timeout
+        volume_size = (maxx - minx + 1) * (maxy - miny + 1) * (maxz - minz + 1)
+        estimated_timeout = max(60, int(volume_size / 10_000_000) * 10)
+        self._set_socket_timeout(estimated_timeout)
+        
+        try:
+            seg_image = self.vast.get_seg_image_rle_decoded(
+                miplevel, minx, maxx, miny, maxy, minz, maxz,
+                surfonlyflag=0, flipflag=0
+            )
+        finally:
+            self._set_socket_timeout(10)
+        
+        if seg_image is None:
+            self.logger.warning(f"Failed to load block data")
+            return None, None
+        
+        # Create binary volume
+        binary_volume = (seg_image == segment_id).astype(np.float32)
+        voxel_count = np.sum(binary_volume)
+        
+        if voxel_count == 0:
+            self.logger.debug(f"  Block empty (no voxels)")
+            return None, None
+        
+        self.logger.debug(f"  Block has {int(voxel_count):,} voxels")
+        
+        del seg_image
+        
+        # Add boundary padding if closing surfaces
+        offset_adjust = np.array([0, 0, 0])
+        if close_surfaces:
+            padded = np.zeros((
+                binary_volume.shape[0] + 2,
+                binary_volume.shape[1] + 2,
+                binary_volume.shape[2] + 2
+            ), dtype=np.float32)
+            padded[1:-1, 1:-1, 1:-1] = binary_volume
+            binary_volume = padded
+            offset_adjust = np.array([-1, -1, -1])
+        
+        # Run marching cubes
+        try:
+            verts, faces, normals, values = measure.marching_cubes(
+                binary_volume,
+                level=0.5,
+                step_size=1
+            )
+        except Exception as e:
+            self.logger.warning(f"  Marching cubes failed for block: {str(e)}")
+            return None, None
+        
+        del binary_volume
+        
+        # Transform coordinates to global space
+        verts = verts + offset_adjust
+        verts[:, 0] += minx
+        verts[:, 1] += miny
+        verts[:, 2] += minz
+        
+        # Scale by voxel size and MIP factor
+        voxel_size = np.array([
+            self.dataset_info['voxelsizex'],
+            self.dataset_info['voxelsizey'],
+            self.dataset_info['voxelsizez']
+        ])
+        
+        verts[:, 0] *= voxel_size[0] * mip_scale[0]
+        verts[:, 1] *= voxel_size[1] * mip_scale[1]
+        verts[:, 2] *= voxel_size[2] * mip_scale[2]
+        
+        # Convert to micrometers
+        if voxel_size[0] > 1:
+            verts *= 0.001
+        
+        return verts, faces
+
+    def _extract_with_blocks(
+        self,
+        segment_id: int,
+        metadata: Dict[str, Any],
+        miplevel: int,
+        close_surfaces: bool
+        ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """
+        Extract surface using block-based processing for large segments.
+        
+        Args:
+            segment_id: Segment ID
+            metadata: Segment metadata
+            miplevel: MIP level
+            close_surfaces: Whether to close boundaries
+            
+        Returns:
+            Tuple of (vertices, faces) or (None, None) on failure
+        """
+        self.logger.info("Using block-based extraction for large segment")
+        
+        bbox = metadata['bbox']
+        
+        # Adjust bounding box for MIP level
+        mip_scale = [1, 1, 1]
+        if miplevel > 0 and self.mip_factors is not None and miplevel <= len(self.mip_factors):
+            mip_scale = self.mip_factors[miplevel - 1]
+        
+        minx = bbox[0] >> miplevel
+        maxx = bbox[3] >> miplevel
+        miny = bbox[1] >> miplevel
+        maxy = bbox[4] >> miplevel
+        minz = bbox[2]
+        maxz = bbox[5]
+        
+        if miplevel > 0 and mip_scale[2] != 1:
+            minz = minz // mip_scale[2]
+            maxz = maxz // mip_scale[2]
+        
+        # Get dataset bounds
+        mip_scale_val = mip_scale if isinstance(mip_scale, list) else [1, 1, 1]
+        max_x_bound = (self.dataset_info['datasizex'] >> miplevel) - 1
+        max_y_bound = (self.dataset_info['datasizey'] >> miplevel) - 1
+        max_z_bound = self.dataset_info['datasizez'] - 1
+        if miplevel > 0 and mip_scale_val[2] != 1:
+            max_z_bound = max_z_bound // mip_scale_val[2]
+        
+        # Add padding for marching cubes
+        padding = 2 if close_surfaces else 1
+        minx = max(0, minx - padding)
+        miny = max(0, miny - padding)
+        minz = max(0, minz - padding)
+        maxx = min(max_x_bound, maxx + padding)
+        maxy = min(max_y_bound, maxy + padding)
+        maxz = min(max_z_bound, maxz + padding)
+        
+        global_bounds = (0, max_x_bound, 0, max_y_bound, 0, max_z_bound)
+        
+        # Calculate block dimensions
+        region_size = [maxx - minx + 1, maxy - miny + 1, maxz - minz + 1]
+        blocks_x, blocks_y, blocks_z = self._calculate_block_dimensions(region_size, miplevel)
+        
+        total_blocks = blocks_x * blocks_y * blocks_z
+        self.logger.info(f"Processing {total_blocks} blocks total")
+        
+        # Calculate block sizes
+        block_size_x = int(np.ceil(region_size[0] / blocks_x))
+        block_size_y = int(np.ceil(region_size[1] / blocks_y))
+        block_size_z = int(np.ceil(region_size[2] / blocks_z))
+        
+        # Set translation to isolate this segment
+        self.vast.set_seg_translation([segment_id], [segment_id])
+        
+        try:
+            # Process blocks
+            merged_verts = None
+            merged_faces = None
+            blocks_processed = 0
+            blocks_with_data = 0
+            
+            for iz in range(blocks_z):
+                for iy in range(blocks_y):
+                    for ix in range(blocks_x):
+                        blocks_processed += 1
+                        
+                        # Calculate block bounds with overlap
+                        bminx = minx + ix * block_size_x - (self.block_overlap if ix > 0 else 0)
+                        bmaxx = min(maxx, minx + (ix + 1) * block_size_x + self.block_overlap)
+                        bminy = miny + iy * block_size_y - (self.block_overlap if iy > 0 else 0)
+                        bmaxy = min(maxy, miny + (iy + 1) * block_size_y + self.block_overlap)
+                        bminz = minz + iz * block_size_z - (self.block_overlap if iz > 0 else 0)
+                        bmaxz = min(maxz, minz + (iz + 1) * block_size_z + self.block_overlap)
+                        
+                        self.logger.info(f"Processing block {blocks_processed}/{total_blocks} " +
+                                    f"({ix},{iy},{iz})")
+                        
+                        # Extract block
+                        block_verts, block_faces = self._extract_single_block(
+                            segment_id, metadata, miplevel,
+                            (bminx, bmaxx, bminy, bmaxy, bminz, bmaxz),
+                            global_bounds, close_surfaces, mip_scale
+                        )
+                        
+                        if block_verts is not None and len(block_verts) > 0:
+                            blocks_with_data += 1
+                            merged_verts, merged_faces = self._merge_meshes(
+                                merged_verts, merged_faces,
+                                block_verts, block_faces
+                            )
+                            self.logger.info(f"  Block contributed {len(block_verts):,} vertices, " +
+                                        f"{len(block_faces):,} faces")
+                            self.logger.info(f"  Total so far: {len(merged_verts):,} vertices, " +
+                                        f"{len(merged_faces):,} faces")
+            
+            self.logger.info(f"Block processing complete: {blocks_with_data}/{total_blocks} blocks had data")
+            
+            if merged_verts is None or len(merged_verts) == 0:
+                self.logger.error("No geometry generated from any block")
+                return None, None
+            
+            self.logger.info(f"Final mesh: {len(merged_verts):,} vertices, {len(merged_faces):,} faces")
+            
+            return merged_verts, merged_faces
+            
+        finally:
+            # Always clear translation
+            self.vast.set_seg_translation([], [])
+
     def extract_segment(
         self,
         segment_id: int,
@@ -252,18 +583,23 @@ class SegmentSurfaceExtractor:
             mem_est = self.estimate_memory_requirements(metadata['bbox_size'], miplevel)
             self.logger.info(f"Estimated peak memory: {mem_est['peak_estimated_gb']:.2f} GB")
             
+            # Choose extraction method based on size
             if mem_est['needs_blocking']:
-                self.logger.warning("Large segment detected - block processing recommended")
-                self.logger.warning("Block processing not yet implemented - attempting full volume extraction")
-                # TODO: Implement block processing in future iteration
-            
-            # Extract surface
-            vertices, faces = self._extract_full_volume(
-                segment_id, 
-                metadata, 
-                miplevel, 
-                close_surfaces
-            )
+                self.logger.warning("Large segment detected - using block processing")
+                vertices, faces = self._extract_with_blocks(
+                    segment_id,
+                    metadata,
+                    miplevel,
+                    close_surfaces
+                )
+            else:
+                # Extract surface with full volume method
+                vertices, faces = self._extract_full_volume(
+                    segment_id, 
+                    metadata, 
+                    miplevel, 
+                    close_surfaces
+                )
             
             if vertices is None or len(vertices) == 0:
                 self.logger.error("Surface extraction produced no geometry")
@@ -581,7 +917,7 @@ class SegmentSurfaceExtractor:
 def main():
     """Example usage demonstrating single segment extraction."""
     print("=" * 80)
-    print("VAST Surface Extraction - Single Segment Demo")
+    print("VAST Surface Extraction - Single Segment")
     print("=" * 80)
     
     # Connect to VAST
@@ -600,30 +936,31 @@ def main():
         # Create extractor
         extractor = SegmentSurfaceExtractor(vast, output_dir="./vast_export")
         
-        # Example: Extract segment 1
-        segment_id = 1
-        
-        print(f"\nExtracting segment {segment_id}...")
-        print("This may take several minutes for large neurons...\n")
-        
-        vertices, faces, output_path = extractor.extract_segment(
-            segment_id=segment_id,
-            miplevel=0,  # Full resolution
-            close_surfaces=False,
-            output_format='obj'
-        )
-        
-        if vertices is not None:
-            print("\n" + "=" * 80)
-            print("SUCCESS!")
-            print("=" * 80)
-            print(f"Mesh saved to: {output_path}")
-            print(f"Vertices: {len(vertices):,}")
-            print(f"Faces: {len(faces):,}")
-
-        else:
-            print("\nExtraction failed - check logs for details")
+        num_segments = vast.get_number_of_segments()
+        for id in range(1,num_segments):
+            segment_id = id
             
+            print(f"\nExtracting segment {segment_id}...")
+            print("This may take several minutes for large neurons...\n")
+            
+            vertices, faces, output_path = extractor.extract_segment(
+                segment_id=segment_id,
+                miplevel=1,  # Full resolution
+                close_surfaces=False,
+                output_format='obj'
+            )
+            
+            if vertices is not None:
+                print("\n" + "=" * 80)
+                print("SUCCESS!")
+                print("=" * 80)
+                print(f"Mesh saved to: {output_path}")
+                print(f"Vertices: {len(vertices):,}")
+                print(f"Faces: {len(faces):,}")
+
+            else:
+                print("\nExtraction failed - check logs for details")
+                
     except Exception as e:
         print(f"\nERROR: {str(e)}")
         import traceback
