@@ -142,14 +142,28 @@ class SegmentSurfaceExtractor:
             return None
         
         # Get segment name if available
-        name = seg_data.get('name', f'Segment_{segment_id}')
+        name = self.vast.get_segment_name(segment_id)
+        if name is None:
+            name = f"Segment_{segment_id}"
+        
+        if 'col1' in seg_data:
+            col1 = seg_data['col1']
+            r = (col1 >> 0) & 0xFF
+            g = (col1 >> 8) & 0xFF
+            b = (col1 >> 16) & 0xFF
+            color = np.array([r, g, b], dtype=np.uint8)
+        elif 'color' in seg_data:
+            color = seg_data['color']
+        else:
+            color = np.array([128, 128, 128], dtype=np.uint8)
+        self.logger.debug(f"Segment {segment_id} color: RGB{tuple(color)}")
         
         metadata = {
             'id': segment_id,
             'name': name,
             'bbox': bbox,
             'bbox_size': [bbox[3]-bbox[0], bbox[4]-bbox[1], bbox[5]-bbox[2]],
-            'color': seg_data.get('color', [128, 128, 128])
+            'color': color
         }
         
         self.logger.info(f"Segment '{name}' (ID {segment_id})")
