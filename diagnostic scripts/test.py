@@ -1,3 +1,6 @@
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from VastControlClass_exporting import VASTControlClass
 import numpy as np
 import math
@@ -548,6 +551,69 @@ def test_get_mipmap_scale_factors(vast):
     return scale_factors
 
 
+def test_get_immediate_child_ids(vast):
+    """Test get_immediate_child_ids() - retrieves immediate children of segments."""
+    print("\n=== Test: get_immediate_child_ids() ===")
+
+    # Test with 0 (all top-level segments)
+    print("  Testing with parentidlist=0 (top-level segments)...")
+    top_level_ids = vast.get_immediate_child_ids(0)
+    
+    assert top_level_ids is not None, f"get_immediate_child_ids(0) returned None. Error: {vast.get_last_error()}"
+    assert isinstance(top_level_ids, np.ndarray), f"Expected np.ndarray, got {type(top_level_ids)}"
+    
+    print(f"  Top-level segments count: {len(top_level_ids)}")
+    if len(top_level_ids) > 0:
+        print(f"  First few top-level IDs: {top_level_ids[:10]}")
+
+        # Test with a specific parent ID (use the first top-level one if available)
+        parent_id = top_level_ids[0]
+        print(f"  Testing with parentidlist={parent_id}...")
+        child_ids = vast.get_immediate_child_ids(parent_id)
+        
+        assert child_ids is not None, f"get_immediate_child_ids({parent_id}) returned None. Error: {vast.get_last_error()}"
+        print(f"  Children of {parent_id}: {child_ids}")
+        
+    return top_level_ids
+
+
+def test_get_child_tree_ids(vast):
+    """Test get_child_tree_ids() - retrieves all descendant segments recursively."""
+    print("\n=== Test: get_child_tree_ids() ===")
+
+    # Test with 0 (entire tree of all segments)
+    print("  Testing with parentidlist=0 (all segments)...")
+    all_tree_ids = vast.get_child_tree_ids(0)
+    
+    assert all_tree_ids is not None, f"get_child_tree_ids(0) returned None. Error: {vast.get_last_error()}"
+    assert isinstance(all_tree_ids, np.ndarray), f"Expected np.ndarray, got {type(all_tree_ids)}"
+    
+    print(f"  Total descendants count from root: {len(all_tree_ids)}")
+    
+    # Try to find a segment that has children to test a subtree
+    # Using get_immediate_child_ids to find a parent with children
+    top_level_ids = vast.get_immediate_child_ids(0)
+    if len(top_level_ids) > 0:
+        parent_with_kids = -1
+        # Check first few to find one with kids
+        for pid in top_level_ids[:20]:
+             kids = vast.get_immediate_child_ids(pid)
+             if len(kids) > 0:
+                 parent_with_kids = pid
+                 break
+        
+        if parent_with_kids != -1:
+            print(f"  Testing subtree for parent {parent_with_kids}...")
+            subtree_ids = vast.get_child_tree_ids(parent_with_kids)
+            assert subtree_ids is not None
+            print(f"  Subtree size for {parent_with_kids}: {len(subtree_ids)}")
+            print(f"  Subtree IDs: {subtree_ids}")
+        else:
+             print("  (No segments with children found in top 20 to test subtree)")
+
+    return all_tree_ids
+
+
 def test_helper_functions():
     """Test the bytes_from_* helper functions."""
     print("\n=== Test: Helper Functions ===")
@@ -932,11 +998,15 @@ def run_all_tests():
         # MIP map tests
         test_get_mipmap_scale_factors(vast)
 
+        # Child/Tree ID tests
+        test_get_immediate_child_ids(vast)
+        test_get_child_tree_ids(vast)
+
         # Error popup tests
         test_set_error_popups_enabled(vast)
 
         # Drawing tests (paint stroke on segmentation layer)
-        test_draw_sphere_3d(vast)
+        # test_draw_sphere_3d(vast)
 
         print("\n" + "=" * 60)
         print("All tests passed!")

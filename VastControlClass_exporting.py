@@ -1317,6 +1317,102 @@ class VASTControlClass:
         return success
 
 ##########################################################################
+# Helper functions
+##########################################################################
+    def get_immediate_child_ids(self, parentidlist: Union[int, List[int], np.ndarray]) -> np.ndarray:
+        """
+        Get the IDs of all segments which are immediate children of any segments in parentidlist.
+        
+        Args:
+            parentidlist: Single parent ID or list of parent IDs. Use 0 to get all top-level segments.
+        
+        Returns:
+            NumPy array of child segment IDs, or empty array on failure.
+        """
+        data = self.get_all_segment_data_matrix()
+        if data is None:
+            return np.array([], dtype=np.int32)
+        
+        # Convert to array and flatten
+        pal = np.atleast_1d(np.array(parentidlist, dtype=np.int32)).flatten()
+        ret = []
+        
+        for parent_id in pal:
+            if parent_id == 0:
+                # Get all top-level IDs (segments with no parent)
+                i = self.get_first_segment_nr()
+                if i > 0:
+                    ret.append(i)
+                    # Follow the sibling chain (column 16 is 'next' sibling, 0-based index 16)
+                    while data[i, 16] > 0:
+                        i = data[i, 16]
+                        ret.append(i)
+            else:
+                # Get children of specific parent
+                # Column 14 is 'child' (0-based index 14)
+                if data[parent_id, 14] > 0:
+                    i = data[parent_id, 14]
+                    ret.append(i)
+                    # Follow the sibling chain
+                    while data[i, 16] > 0:
+                        i = data[i, 16]
+                        ret.append(i)
+        
+        return np.array(ret, dtype=np.int32)
+
+
+    def _get_child_tree_ids_recursive(self, data: np.ndarray, parentidlist: Union[int, List[int], np.ndarray]) -> List[int]:
+        """
+        Recursive helper for get_child_tree_ids.
+        
+        Args:
+            data: Segment data matrix from get_all_segment_data_matrix.
+            parentidlist: Parent ID or list of parent IDs.
+        
+        Returns:
+            List of all descendant IDs.
+        """
+        ret = []
+        pal = np.atleast_1d(np.array(parentidlist, dtype=np.int32)).flatten()
+        
+        for parent_id in pal:
+            # Column 14 is 'child' (0-based index 14)
+            if data[parent_id, 14] > 0:
+                i = data[parent_id, 14]
+                ret.append(i)
+                # Recursively add child's entire tree
+                ret.extend(self._get_child_tree_ids_recursive(data, i))
+                
+                # Follow sibling chain and add their trees
+                while data[i, 16] > 0:
+                    i = data[i, 16]
+                    ret.append(i)
+                    ret.extend(self._get_child_tree_ids_recursive(data, i))
+        
+        return ret
+
+
+    def get_child_tree_ids(self, parentidlist: Union[int, List[int], np.ndarray]) -> np.ndarray:
+        """
+        Get the IDs of all segments which are children (recursively) of any segments in parentidlist.
+        
+        This returns the entire descendant tree, not just immediate children.
+        
+        Args:
+            parentidlist: Single parent ID or list of parent IDs.
+        
+        Returns:
+            NumPy array of all descendant segment IDs, or empty array on failure.
+        """
+        data = self.get_all_segment_data_matrix()
+        if data is None:
+            return np.array([], dtype=np.int32)
+        
+        ret = self._get_child_tree_ids_recursive(data, parentidlist)
+        return np.array(ret, dtype=np.int32)
+
+
+##########################################################################
 # Internal methods
 ##########################################################################
 
