@@ -12,7 +12,7 @@ Date: 2026-02-03
 import numpy as np
 from skimage import measure
 from typing import Optional, Tuple, Dict, Any
-import os
+import sys
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -557,6 +557,10 @@ class SegmentSurfaceExtractor:
             # Always clear translation
             self.vast.set_seg_translation([], [])
 
+    #######################################################
+    # Extracting mesh
+    #######################################################
+
     def extract_segment(
         self,
         segment_id: int,
@@ -798,6 +802,277 @@ class SegmentSurfaceExtractor:
         
         return verts, faces
     
+    ########################################################
+    # Extracting voxel data
+    ########################################################
+    def extract_segment_voxel(
+        self,
+        segment_id: int,
+        miplevel: int = 0,
+        padding: int = 1,
+        output_filename: Optional[str] = None
+    ) -> Tuple[Optional[np.ndarray], Optional[Tuple[int, int, int]], Optional[Tuple[float, float, float]], Optional[str]]:
+        """
+        Extract voxel mask for a single segment (for skeletonization pipeline).
+        
+        This method extracts the raw binary voxel mask without any cleaning operations.
+        The mask can then be passed to cleaning and skeletonization functions.
+        
+        Args:
+            segment_id: Segment ID to extract
+            miplevel: MIP level (0 = full resolution, higher = coarser)
+            padding: Voxels of padding around bounding box
+            output_filename: Optional filename for saving mask as .npy
+            
+        Returns:
+            Tuple of (mask, bbox_min_vox, voxel_size_um, output_path)
+            - mask: bool[z, y, x] - Boolean 3D array of segment voxels
+            - bbox_min_vox: (minx, miny, minz) - Origin coordinates in voxel space
+            - voxel_size_um: (sx, sy, sz) - Voxel dimensions in microns (includes MIP scaling)
+            - output_path: Path to saved .npy file (if output_filename provided) or None
+            Returns (None, None, None, None) if extraction fails
+            
+        Example:
+            >>> extractor = SegmentSurfaceExtractor(vast)
+            >>> mask, origin, voxel_size, path = extractor.extract_segment_voxel(
+            ...     segment_id=1, 
+            ...     miplevel=1,
+            ...     output_filename="segment_001_mask.npy"
+            ... )
+            >>> # mask is ready for cleaning and skeletonization
+        """
+        self.logger.info("=" * 80)
+        self.logger.info(f"Starting voxel extraction for segment {segment_id}")
+        self.logger.info("=" * 80)
+        
+        try:
+            # Get segment metadata
+            metadata = self.get_segment_metadata(segment_id)
+            if metadata is None:
+                self.logger.error(f"Cannot extract segment {segment_id} - metadata retrieval failed")
+                return None, None, None, None
+            
+            # Extract the mask
+            mask, bbox_min_vox, voxel_size_um = self._extract_full_volume_mask(
+                segment_id, 
+                metadata, 
+                miplevel,
+                padding
+            )
+            
+            if mask is None:
+                self.logger.error("Voxel mask extraction failed")
+                return None, None, None, None
+            
+            voxel_count = np.sum(mask)
+            if voxel_count == 0:
+                self.logger.error(f"Segment {segment_id} has no voxels in extracted region")
+                return None, None, None, None
+            
+            self.logger.info(f"Extracted mask: {mask.shape} with {int(voxel_count):,} voxels")
+            self.logger.info(f"  Origin (voxels): {bbox_min_vox}")
+            self.logger.info(f"  Voxel size (um): {voxel_size_um}")
+            
+            # Save to file if requested
+            output_path = None
+            if output_filename:
+                output_path = self._save_voxel_mask(
+                    mask,
+                    bbox_min_vox,
+                    voxel_size_um,
+                    metadata,
+                    output_filename
+                )
+            
+            # Log success
+            self.logger.info("=" * 80)
+            self.logger.info("Voxel extraction completed successfully!")
+            self.logger.info(f"  Mask shape: {mask.shape}")
+            self.logger.info(f"  Voxel count: {int(voxel_count):,}")
+            if output_path:
+                self.logger.info(f"  Output: {output_path}")
+            self.logger.info("=" * 80)
+            
+            return mask, bbox_min_vox, voxel_size_um, output_path
+            
+        except Exception as e:
+            self.logger.error(f"Voxel extraction failed: {str(e)}", exc_info=True)
+            return None, None, None, None
+
+    def _extract_full_volume_mask(
+        self,
+        segment_id: int,
+        metadata: Dict[str, Any],
+        miplevel: int,
+        padding: int = 1
+    ) -> Tuple[np.ndarray, Tuple[int, int, int], Tuple[float, float, float]]:
+        """
+        Extract the binary voxel mask for a segment at a specific MIP level.
+        
+        This is a low-level extraction method that returns the raw binary mask
+        without any cleaning operations. The mask is suitable for further processing
+        in the skeletonization pipeline.
+        
+        Args:
+            segment_id: Segment ID to extract
+            metadata: Segment metadata from get_segment_metadata()
+            miplevel: MIP level (0 = full resolution)
+            padding: Voxels of padding to add around bounding box (default: 1)
+            
+        Returns:
+            Tuple of (mask, bbox_min_vox, voxel_size_um)
+            - mask: bool[z, y, x] - Boolean mask of the segment
+            - bbox_min_vox: (minx, miny, minz) - Minimum x/y/z used to fetch the volume in voxels
+            - voxel_size_um: (sx, sy, sz) - Voxel size in microns, including mip scaling
+            
+        Note:
+            - Z dimension may not be MIP-scaled depending on dataset configuration
+            - Coordinates are in (Z, Y, X) order following numpy convention
+            - Returns (None, None, None) on failure
+        """
+        bbox = metadata['bbox']
+        
+        # Adjust bounding box for MIP level
+        mip_scale = [1, 1, 1]
+        if miplevel > 0 and self.mip_factors is not None and miplevel <= len(self.mip_factors):
+            mip_scale = self.mip_factors[miplevel - 1]
+        
+        minx = bbox[0] >> miplevel
+        maxx = bbox[3] >> miplevel
+        miny = bbox[1] >> miplevel
+        maxy = bbox[4] >> miplevel
+        minz = bbox[2]
+        maxz = bbox[5]
+        
+        if miplevel > 0 and mip_scale[2] != 1:
+            minz = minz // mip_scale[2]
+            maxz = maxz // mip_scale[2]
+        
+        mip_scale_val = mip_scale if isinstance(mip_scale, list) else [1, 1, 1]
+        max_x_bound = (self.dataset_info['datasizex'] >> miplevel) - 1
+        max_y_bound = (self.dataset_info['datasizey'] >> miplevel) - 1
+        max_z_bound = self.dataset_info['datasizez'] - 1
+        if miplevel > 0 and mip_scale_val[2] != 1:
+            max_z_bound = max_z_bound // mip_scale_val[2]
+
+        # Add padding around bounding box, clamped to dataset bounds
+        minx = max(0, minx - padding)
+        miny = max(0, miny - padding)
+        minz = max(0, minz - padding)
+        maxx = min(max_x_bound, maxx + padding)  # CLAMP
+        maxy = min(max_y_bound, maxy + padding)  # CLAMP
+        maxz = min(max_z_bound, maxz + padding)  # CLAMP
+        
+        self.logger.info(f"Loading volume at MIP {miplevel}")
+        self.logger.info(f"  Region: X=[{minx},{maxx}] Y=[{miny},{maxy}] Z=[{minz},{maxz}]")
+        
+        # Set translation to isolate this segment
+        self.vast.set_seg_translation([segment_id], [segment_id])
+        
+        # Load segmentation data
+        # Increase timeout for large transfers (estimate: 1 second per 10M voxels)
+        volume_size = (maxx - minx + 1) * (maxy - miny + 1) * (maxz - minz + 1)
+        estimated_timeout = max(60, int(volume_size / 10_000_000) * 10)  # At least 60 seconds
+        self.logger.debug(f"Setting socket timeout to {estimated_timeout}s for {volume_size:,} voxel request")
+        self._set_socket_timeout(estimated_timeout)
+
+        try:
+            seg_image = self.vast.get_seg_image_rle_decoded(
+                miplevel, minx, maxx, miny, maxy, minz, maxz,
+                surfonlyflag=0, flipflag=0
+            )
+        finally:
+            # Always clear translation
+            self.vast.set_seg_translation([], [])
+            # Reset to default timeout
+            self._set_socket_timeout(10)
+        
+        if seg_image is None:
+            self.logger.error("Failed to load segmentation data from VAST")
+            return None, None, None
+        
+        self.logger.info(f"Loaded volume shape: {seg_image.shape}")
+        
+        # Create binary volume
+        self.logger.info("Creating binary volume...")
+        mask = (seg_image == segment_id).astype(bool)
+        
+        # Store the min bounds in voxels
+        bbox_min_vox = (minx, miny, minz)
+        
+        # Calculate voxel size in microns, including mip scaling
+        # Base voxel sizes from dataset info (in nm)
+        base_voxel_size = np.array([
+            self.dataset_info['voxelsizex'],
+            self.dataset_info['voxelsizey'],
+            self.dataset_info['voxelsizez']
+        ])
+        
+        # Apply MIP scaling
+        voxel_size_nm = base_voxel_size * mip_scale_val
+        
+        # Convert to microns
+        voxel_size_um = tuple(voxel_size_nm * 0.001)
+
+        return mask, bbox_min_vox, voxel_size_um
+    
+    def _save_voxel_mask(
+        self,
+        mask: np.ndarray,
+        bbox_min_vox: Tuple[int, int, int],
+        voxel_size_um: Tuple[float, float, float],
+        metadata: Dict[str, Any],
+        custom_filename: Optional[str]
+    ) -> str:
+        """
+        Save voxel mask and metadata to .npz file.
+        
+        Args:
+            mask: Boolean voxel mask
+            bbox_min_vox: Origin coordinates in voxel space
+            voxel_size_um: Voxel dimensions in microns
+            metadata: Segment metadata
+            custom_filename: Custom filename or None
+            
+        Returns:
+            Path to saved file
+        """
+        # Generate filename
+        if custom_filename:
+            base_name = custom_filename
+            if not base_name.endswith('.npz'):
+                base_name += '.npz'
+        else:
+            # Clean segment name for filename
+            clean_name = metadata['name'].replace(' ', '_')
+            # Remove special characters
+            clean_name = ''.join(c for c in clean_name if c.isalnum() or c in ['_', '-'])
+            base_name = f"seg_{metadata['id']:04d}_{clean_name}_mask.npz"
+        
+        # Create output directory structure
+        voxels_dir = self.output_dir / "voxels"
+        voxels_dir.mkdir(exist_ok=True)
+        
+        output_path = voxels_dir / base_name
+        
+        # Save mask and metadata
+        np.savez_compressed(
+            output_path,
+            mask=mask,
+            bbox_min_vox=bbox_min_vox,
+            voxel_size_um=voxel_size_um,
+            segment_id=metadata['id'],
+            segment_name=metadata['name']
+        )
+        
+        self.logger.info(f"Saved voxel mask: {output_path}")
+        
+        return str(output_path)
+
+    #######################################################
+    # Saving meshes 
+    #######################################################
+
     def _save_mesh(
         self,
         vertices: np.ndarray,
@@ -929,9 +1204,8 @@ class SegmentSurfaceExtractor:
 
 
 def main():
-    """Example usage demonstrating single segment extraction."""
     print("=" * 80)
-    print("VAST Surface Extraction - Single Segment")
+    print("VAST Surface Extraction")
     print("=" * 80)
     
     # Connect to VAST
@@ -945,44 +1219,69 @@ def main():
         return
     
     print("Connected to VAST")
-    
-    try:
-        # Create extractor
-        extractor = SegmentSurfaceExtractor(vast, output_dir="./vast_export")
-        
-        num_segments = vast.get_number_of_segments()
-        for id in range(1,num_segments):
-            segment_id = id
-            
+    if(len(sys.argv) > 1 and sys.argv[1] == "skeleton"):
+        try:
+            extractor = SegmentSurfaceExtractor(vast, output_dir="./vast_export")
+
+            segment_id = 1
+                
             print(f"\nExtracting segment {segment_id}...")
             print("This may take several minutes for large neurons...\n")
             
             vertices, faces, output_path = extractor.extract_segment(
                 segment_id=segment_id,
-                miplevel=1,  # Full resolution
+                miplevel=1,  # Full resolution = 0, Half resolution = 1, Quarter resolution = 2
                 close_surfaces=False,
-                output_format='obj'
+                output_format='swc'
             )
             
-            if vertices is not None:
-                print("\n" + "=" * 80)
-                print("SUCCESS!")
-                print("=" * 80)
-                print(f"Mesh saved to: {output_path}")
-                print(f"Vertices: {len(vertices):,}")
-                print(f"Faces: {len(faces):,}")
-
-            else:
-                print("\nExtraction failed - check logs for details")
+        except Exception as e:
+            print(f"\nERROR: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            
+        finally:
+            vast.disconnect()
+            print("\nDisconnected from VAST")
+    
+    else:
+        try:
+            # Create extractor
+            extractor = SegmentSurfaceExtractor(vast, output_dir="./vast_export")
+            
+            num_segments = vast.get_number_of_segments()
+            for id in range(1,num_segments):
+                segment_id = id
                 
-    except Exception as e:
-        print(f"\nERROR: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        
-    finally:
-        vast.disconnect()
-        print("\nDisconnected from VAST")
+                print(f"\nExtracting segment {segment_id}...")
+                print("This may take several minutes for large neurons...\n")
+                
+                vertices, faces, output_path = extractor.extract_segment(
+                    segment_id=segment_id,
+                    miplevel=1,  # Full resolution
+                    close_surfaces=False,
+                    output_format='obj'
+                )
+                
+                if vertices is not None:
+                    print("\n" + "=" * 80)
+                    print("SUCCESS!")
+                    print("=" * 80)
+                    print(f"Mesh saved to: {output_path}")
+                    print(f"Vertices: {len(vertices):,}")
+                    print(f"Faces: {len(faces):,}")
+
+                else:
+                    print("\nExtraction failed - check logs for details")
+                    
+        except Exception as e:
+            print(f"\nERROR: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            
+        finally:
+            vast.disconnect()
+            print("\nDisconnected from VAST")
 
 
 if __name__ == "__main__":
