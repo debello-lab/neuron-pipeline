@@ -558,7 +558,7 @@ class VASTControlClass:
         while p < n:
             t   = indata[p]
 
-            if t   == 1:  # int32
+            if t   == 1:  # uint32
                 if p + 5 > n:
                     break
                 val = struct.unpack("<I", indata[p+1:p+5])[0]
@@ -590,7 +590,7 @@ class VASTControlClass:
                 val = struct.unpack("<i", indata[p+1:p+5])[0]
                 ints.append(val)
                 p  += 5
-            elif t == 5: # uint64
+            elif t == 6: # uint64
                 if p + 9 > n:
                     break
                 val = struct.unpack("<Q", indata[p+1:p+9])[0]
@@ -674,16 +674,16 @@ class VASTControlClass:
         try:
             parsed = self.parse_payload(data)
 
-            u32    = parsed.get("uint32", [])
-            f64    = parsed.get("float64", [])
-            i32    = parsed.get("int32", [])
-            texts  = parsed.get("strings", [])
+            u32    = parsed.get("uints", [])
+            f64    = parsed.get("doubles", [])
+            i32    = parsed.get("ints", [])
+            texts  = parsed.get("text", [])
 
             # Expected: 1 uint, 7 doubles, 0 ints, 5 text strings
             if len(u32) != 1 or len(f64) != 7 or len(i32) != 0 or len(texts) != 5:
                 print(
                     f"Unexpected payload layout: "
-                    f"uint32={len(u32)}, float64={len(f64)}, int32={len(i32)}, strings={len(texts)}"
+                    f"uints={len(u32)}, doubles={len(f64)}, ints={len(i32)}, text={len(texts)}"
                 )
                 return {}
             
@@ -713,6 +713,22 @@ class VASTControlClass:
         """Query VAST for the most recent error code (like MATLAB getlasterror)."""
         return self.last_error
 
+    def set_error_popups_enabled(self, code, enabled: bool) -> bool:
+        """
+        Enable or disable error popups in VAST for a specific error code.
+        Corresponds to MATLAB seterrorpopupenabled(code, enabled).
+        """
+        payload = self._encode_uint32(code) + self._encode_uint32(1 if enabled else 0)
+        msg_type, data = self.send_command(SETERRORPOPUPSENABLED, payload)
+
+        if msg_type == 1:
+            self.last_error = 0
+            return True
+        else:
+            self.last_error = msg_type
+            print(f"Error setting error popup enabled: {errorCodes.get(msg_type, 'Unknown error')}")
+            return False
+        
     ############################
     #     LAYER FUNCTIONS      #
     ############################
@@ -2189,13 +2205,9 @@ class VASTControlClass:
         self.last_error = 0
         return segments
 
-    def get_all_segment_data_matrix(self) -> Tuple[Optional[np.ndarray], int]:
+    def get_all_segment_data_matrix(self) -> Tuple[np.ndarray, int]:
         """
-        Get metadata for all segments as a matrix.
-        
-        Same as get_all_segment_data but returns data as a 2D numpy array with one row
-        per segment and one column per data value.
-        
+        Get metadata for all segments as a matrix.        
         Columns are:
         0: segment index (0-based)
         1: flags
@@ -2207,78 +2219,112 @@ class VASTControlClass:
         18-23: boundingbox (minx, maxx, miny, maxy, minz, maxz)
         
         Returns:
-            Tuple of (matrix, success) where matrix is numpy array of shape (num_segments, 24)
-            or None on failure, and success is 1 or 0
+            Tuple of (matrix, success) where matrix is numpy array of shape (num_segments-1, 24)
+            or empty array on failure, and success is 1 or 0
         """
+        
         msg_type, data = self.send_command(GETALLSEGMENTDATA)
         
         if msg_type != 1:
             self.last_error = msg_type
-            return None, 0
+            return np.array([]), 0
         
-        if len(data) < 68:  # Minimum: 16 byte header + at least 1 segment (17 uint32s)
+        # Check minimum data size (need at least count field)
+        if len(data) < 4:
             self.last_error = 2
-            return None, 0
+            return np.array([]), 0
         
         try:
-            # Parse as uint32 and int32 arrays, starting from byte 16
-            uid = np.frombuffer(data[16:], dtype=np.uint32)
-            sid = np.frombuffer(data[16:], dtype=np.int32)
+            # Parse as uint32 and int32 arrays
+            # MATLAB code: uid=typecast(obj.indata(17:end), 'uint32');
+            # In MATLAB, obj.indata(17:end) skips 16 bytes of header
+            # But in Python, send_command already stripped the header, so we start at 0
+            uid = np.frombuffer(data, dtype=np.uint32)
+            sid = np.frombuffer(data, dtype=np.int32)
             
+            # First uint32 is the count (MATLAB: uid(1))
+            # In MATLAB arrays are 1-indexed, Python is 0-indexed
             num_segments = uid[0]
             
             if num_segments == 0:
                 self.last_error = 0
                 return np.zeros((0, 24), dtype=np.float64), 1
             
+            # Verify we have enough data
+            # Each segment needs 17 uint32 values
+            expected_uint32_count = 1 + num_segments * 17
+            if len(uid) < expected_uint32_count:
+                self.last_error = 2
+                return np.array([]), 0
+            
             # Create output matrix: num_segments x 24 columns
             segdatamatrix = np.zeros((num_segments, 24), dtype=np.float64)
             
-            sp = 1  # Start position (skip count at uid[0])
+            # MATLAB starts at sp=2 (1-indexed, so element 2 is uid(2))
+            # In Python 0-indexed, this is sp=1
+            sp = 1
             
+            # MATLAB loop: for i=1:1:uid(1)
             for i in range(num_segments):
-                # Column 0: segment index (0-based)
+                # Column 0: segment index (MATLAB: segdatamatrix(i,1)=i-1)
                 segdatamatrix[i, 0] = i
                 
-                # Column 1: flags
+                # Column 1: flags (MATLAB: segdatamatrix(i,2)=uid(sp))
                 segdatamatrix[i, 1] = uid[sp]
                 
-                # Columns 2-5: Extract RGB + pattern from col1 (uid[sp+1])
-                # Format: [pattern][blue][green][red]
-                segdatamatrix[i, 2] = (uid[sp + 1] >> 24) & 0xFF  # red
-                segdatamatrix[i, 3] = (uid[sp + 1] >> 16) & 0xFF  # green
-                segdatamatrix[i, 4] = (uid[sp + 1] >> 8) & 0xFF   # blue
-                segdatamatrix[i, 5] = uid[sp + 1] & 0xFF          # pattern1
+                # Columns 2-5: Extract RGBP from col1
+                # MATLAB: segdatamatrix(i,3)=bitand(bitshift(uid(sp+1),-24),255)
+                segdatamatrix[i, 2] = (uid[sp + 1] >> 24) & 0xFF  # R
+                segdatamatrix[i, 3] = (uid[sp + 1] >> 16) & 0xFF  # G
+                segdatamatrix[i, 4] = (uid[sp + 1] >> 8) & 0xFF   # B
+                segdatamatrix[i, 5] = uid[sp + 1] & 0xFF          # P
                 
-                # Columns 6-9: Extract RGB + pattern from col2 (uid[sp+2])
-                segdatamatrix[i, 6] = (uid[sp + 2] >> 24) & 0xFF  # red
-                segdatamatrix[i, 7] = (uid[sp + 2] >> 16) & 0xFF  # green
-                segdatamatrix[i, 8] = (uid[sp + 2] >> 8) & 0xFF   # blue
-                segdatamatrix[i, 9] = uid[sp + 2] & 0xFF          # pattern2
+                # Columns 6-9: Extract RGBP from col2
+                # MATLAB: segdatamatrix(i,7)=bitand(bitshift(uid(sp+2),-24),255)
+                segdatamatrix[i, 6] = (uid[sp + 2] >> 24) & 0xFF  # R
+                segdatamatrix[i, 7] = (uid[sp + 2] >> 16) & 0xFF  # G
+                segdatamatrix[i, 8] = (uid[sp + 2] >> 8) & 0xFF   # B
+                segdatamatrix[i, 9] = uid[sp + 2] & 0xFF          # P
                 
-                # Columns 10-12: anchorpoint (x, y, z) - signed integers
+                # Columns 10-12: anchorpoint (x, y, z)
+                # MATLAB: segdatamatrix(i,11:13)=id(sp+3:sp+5)
+                # MATLAB sp+3:sp+5 is inclusive, so 3 elements starting at sp+3
+                # In Python, this is sp+3:sp+6 (MATLAB sp+3:sp+5 = 3 elements)
                 segdatamatrix[i, 10:13] = sid[sp + 3:sp + 6]
                 
                 # Columns 13-16: hierarchy (parent, child1, child2, next)
+                # MATLAB: segdatamatrix(i,14:17)=uid(sp+6:sp+9)
+                # MATLAB sp+6:sp+9 is inclusive, so 4 elements
+                # In Python, this is sp+6:sp+10 (MATLAB sp+6:sp+9 = 4 elements)
                 segdatamatrix[i, 13:17] = uid[sp + 6:sp + 10]
                 
                 # Column 17: collapsednr
+                # MATLAB: segdatamatrix(i,18)=uid(sp+10)
                 segdatamatrix[i, 17] = uid[sp + 10]
                 
-                # Columns 18-23: boundingbox (minx, maxx, miny, maxy, minz, maxz) - signed
+                # Columns 18-23: boundingbox (minx, maxx, miny, maxy, minz, maxz)
+                # MATLAB: segdatamatrix(i,19:24)=id(sp+11:sp+16)
+                # MATLAB sp+11:sp+16 is inclusive, so 6 elements
+                # In Python, this is sp+11:sp+17 (MATLAB sp+11:sp+16 = 6 elements)
                 segdatamatrix[i, 18:24] = sid[sp + 11:sp + 17]
                 
+                # Move to next segment
                 sp += 17
             
-            # Remove first row (row 0, which corresponds to segment at index -1)
-            segdatamatrix = segdatamatrix[1:, :]
+            # Remove first row (segment at index 0, which is typically background/invalid)
+            # MATLAB: segdatamatrix=segdatamatrix(2:end,:)
+            # MATLAB 2:end means skip first row (index 1 in MATLAB)
+            # In Python, this is [1:, :]
+            if segdatamatrix.shape[0] > 0:
+                segdatamatrix = segdatamatrix[1:, :]
             
             self.last_error = 0
             return segdatamatrix, 1
         
         except Exception as e:
+            print(f"Error in get_all_segment_data_matrix: {e}")
             self.last_error = 2
-            return None, 0
+            return np.array([]), 0
 
     def get_all_segment_names(self) -> List[str]:
         """Get names of all segments in the dataset."""
@@ -2796,13 +2842,14 @@ class VASTControlClass:
                                      request_load: bool = False) -> tuple:
         """
         Get decoded RLE image with bounding boxes for each segment.
-        
+
         Returns:
             Tuple of (seg_image, values, counts, bboxes) where:
-            - seg_image: numpy array of shape (Y, X, Z)
+            - seg_image: numpy array of shape (X, Y, Z) matching VAST coordinate system
             - values: List of unique segment IDs
             - counts: List of voxel counts
             - bboxes: List of bounding boxes [xmin, ymin, zmin, xmax, ymax, zmax]
+                     Coordinates are 0-indexed and match seg_image dimensions
             Returns (None, [], [], []) on failure
         """
         
@@ -2881,9 +2928,10 @@ class VASTControlClass:
             
             dp += count
         
-        # Reshape image
+        # Reshape image to (X, Y, Z) - matches bbox coordinate system
         seg_image = seg_image.reshape(size_x, size_y, size_z)
-        seg_image = np.transpose(seg_image, (1, 0, 2))
+        # Note: Bboxes are in [xmin, ymin, zmin, xmax, ymax, zmax] format
+        # This ordering is consistent with the reshaped image dimensions
         
         # Extract results for non-zero segments
         nonzero_indices = np.where(counts_array > 0)[0]
