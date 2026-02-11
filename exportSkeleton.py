@@ -11,72 +11,12 @@ import pandas as pd
 import time
 import socket
 
-# Import existing modules
-from VastControlClass_exporting import VASTControlClass
+
 from extract_surfaces import SegmentSurfaceExtractor
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("VAST_Pipeline")
-
-class VASTClient(VASTControlClass):
-    """
-    Extended VAST Control Class with Annotation support.
-    """
-    def __init__(self):
-        super().__init__()
-
-    def get_anno_layer_count(self, layer_nr: int) -> int:
-        """Get number of objects in an annotation layer."""
-        payload = self.bytes_from_uint32(layer_nr)
-        msg_type, data = self.send_command(self.GETANNOLAYERNROFOBJECTS, payload)
-        if msg_type != 1:
-            return -1
-        parsed = self.parse_payload(data)
-        if parsed['uints']:
-            return parsed['uints'][0]
-        return 0
-
-    def get_anno_layer_objects(self, layer_nr: int) -> List[Dict[str, Any]]:
-        """
-        Get all objects from an annotation layer.
-        Note: The API for GETANNOLAYEROBJECTDATA (71) is not fully documented in the provided file.
-        I will assume it returns a list of object properties.
-        """
-        # This is a placeholder. Without the exact API spec for command 71, 
-        # we might need to iterate or parse a complex blob.
-        # For now, let's try to get object NAMES as a proxy for existence.
-        
-        objects = []
-        count = self.get_anno_layer_count(layer_nr)
-        if count <= 0:
-            return objects
-
-        # Try Getting Names
-        payload = self.bytes_from_uint32(layer_nr)
-        msg_type, data = self.send_command(self.GETANNOLAYEROBJECTNAMES, payload)
-        if msg_type == 1:
-            parsed = self.parse_payload(data)
-            names = parsed['text']
-            # We assume IDs are 0..Count-1 or we need to find how IDs are returned.
-            # Usually VAST lists match the count.
-            for i, name in enumerate(names):
-                 objects.append({'id': i, 'name': name, 'layer_nr': layer_nr})
-        
-        return objects
-
-    def get_annotation_object_data(self, layer_nr: int, object_id: int) -> Optional[Dict]:
-        """
-        Get data for a specific annotation object.
-        Command 71/90? 
-        The provided file lists GETANNOOBJECT = 90. Let's try that.
-        """
-        # Payload: likely layer_nr + object_id? or just object_id (unique)?
-        # VAST Lite usually uses ID.
-        # Let's assume Unique ID if possible, or Layer+Index.
-        # If we use GETANNOOBJECT (90):
-        # Implementation depends on API.
-        pass
 
 class Skeletonizer:
     def __init__(self, output_dir: Path):
@@ -191,61 +131,9 @@ class Skeletonizer:
                     f.write(f"{new_id} 0 {data['x']:.3f} {data['y']:.3f} {data['z']:.3f} 1.0 {parent_new}\n")
 
 
-
-def list_segments(client: VASTClient):
-    """List all segments with their basic info."""
-    logger.info("Fetching segment list...")
-    # Get all names
-    names = client.get_all_segment_names()
-    if not names:
-        logger.warning("No segment names found.")
-        return
-
-    # Get all data (for bounding boxes/sizes)
-    # Note: get_all_segment_data might be heavy if many segments, but usually fine.
-    seg_data = client.get_all_segment_data()
-    
-    # Create a map of ID -> Data
-    data_map = {item['id']: item for item in seg_data} if seg_data else {}
-    
-    logger.info(f"Found {len(names)} segments (including background).")
-    
-    print(f"{'ID':<5} {'Name':<30} {'BBox Vol (Approx)':<15} {'Children'}")
-    print("-" * 70)
-    
-    count = 0
-    for i, name in enumerate(names):
-        if i == 0: continue # Skip background
-        
-        info = data_map.get(i)
-        bbox_vol = "N/A"
-        children = "N/A"
-        
-        if info:
-            bb = info['boundingbox'] # x1,y1,z1, x2,y2,z2
-            vol = (bb[3]-bb[0]) * (bb[4]-bb[1]) * (bb[5]-bb[2])
-            bbox_vol = f"{vol:,}"
-            children = info['hierarchy'][1] # child
-            
-        # Only print valid ones or first 20
-        if info and vol > 0:
-            print(f"{i:<5} {name[:30]:<30} {bbox_vol:<15} {children}")
-            count += 1
-            if count > 20:
-                print("... (more segments exist)")
-                break
-
 def main():
-    try:
-        
-        # Connect to examine segments
-        client = VASTClient()
-        if client.connect("127.0.0.1", 22081, 10):
-            list_segments(client)
-            client.disconnect()
-            
-    except Exception as e:
-        logger.error(f"An error occurred: {e}", exc_info=True)
+    print("main")
+
 
 if __name__ == "__main__":
     main()
