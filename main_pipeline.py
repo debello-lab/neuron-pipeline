@@ -17,6 +17,8 @@ The order of operations is as follows:
 8. Pass skeletonized neurons to Arbor for simulation.
 
 """
+from extract_surfaces import SegmentSurfaceExtractor
+
 
 def main():
     # Step 1: Extract surfaces. 
@@ -31,6 +33,7 @@ def main():
     
 
     # Step 2: Clean meshes.
+    # Using 
     #   2A Clean voxel mask (required for SWC):
     #       connected-component filtering (kills specks)
     #       optional hole fill (careful)
