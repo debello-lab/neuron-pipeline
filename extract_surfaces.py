@@ -805,6 +805,7 @@ class SegmentSurfaceExtractor:
     ########################################################
     # Extracting voxel data
     ########################################################
+    
     def extract_segment_voxel(
         self,
         segment_id: int,
@@ -1219,33 +1220,24 @@ def main():
         return
     
     print("Connected to VAST")
-    if(len(sys.argv) > 1 and sys.argv[1] == "skeleton"):
-        try:
-            extractor = SegmentSurfaceExtractor(vast, output_dir="./vast_export")
+    try:
+        if(len(sys.argv) > 1 and sys.argv[1] == "skeleton"):
 
-            segment_id = 1
+                extractor = SegmentSurfaceExtractor(vast, output_dir="./vast_export")
+
+                segment_id = 1
+                    
+                print(f"\nExtracting segment {segment_id}...")
+                print("This may take several minutes for large neurons...\n")
                 
-            print(f"\nExtracting segment {segment_id}...")
-            print("This may take several minutes for large neurons...\n")
-            
-            vertices, faces, output_path = extractor.extract_segment(
-                segment_id=segment_id,
-                miplevel=1,  # Full resolution = 0, Half resolution = 1, Quarter resolution = 2
-                close_surfaces=False,
-                output_format='swc'
-            )
-            
-        except Exception as e:
-            print(f"\nERROR: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            
-        finally:
-            vast.disconnect()
-            print("\nDisconnected from VAST")
-    
-    else:
-        try:
+                vertices, faces, output_path = extractor.extract_segment(
+                    segment_id=segment_id,
+                    miplevel=1,  # Full resolution = 0, Half resolution = 1, Quarter resolution = 2
+                    close_surfaces=False,
+                    output_format='swc'
+                )
+        
+        else:
             # Create extractor
             extractor = SegmentSurfaceExtractor(vast, output_dir="./vast_export")
             
@@ -1274,14 +1266,14 @@ def main():
                 else:
                     print("\nExtraction failed - check logs for details")
                     
-        except Exception as e:
-            print(f"\nERROR: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            
-        finally:
-            vast.disconnect()
-            print("\nDisconnected from VAST")
+    except Exception as e:
+        print(f"\nERROR: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        
+    finally:
+        vast.disconnect()
+        print("\nDisconnected from VAST")
 
 
 if __name__ == "__main__":
