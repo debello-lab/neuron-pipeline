@@ -1,12 +1,13 @@
 """
-Production Surface Extraction for VAST Segmentation Data
-Neural Reconstruction Pipeline
+Surface Extraction for VAST Segmentation Data
 
 This module extracts 3D surface meshes from individual segments in VAST datasets.
 Designed for neurons ranging from thousands to tens of millions of voxels.
 
+Functions for extracting obj/ply meshes as well as voxel masks for skeletonization.
+
 Author: Nicolas Randazzo
-Date: 2026-02-03
+Date: 2026-02-17
 """
 
 import numpy as np
