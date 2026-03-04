@@ -18,12 +18,13 @@ import logging
 
 import networkx as nx
 
-from VastControlClass_exporting import VASTControlClass
-from segment_classifier import SegmentClassifier, SegmentRegistry
-from extract_surfaces import SegmentSurfaceExtractor
-from voxel_cleaning import VoxelCleaner
-from skeletonization import SkeletonExtractor, SWCWriter
-from centroid_extraction import CentroidExtractor, CentroidTable
+from vastpy.control.exporting import VASTControlClass
+
+from neuron_pipeline.stages.segment_classifier import SegmentClassifier, SegmentRegistry
+from neuron_pipeline.stages.extract_surfaces import SegmentSurfaceExtractor
+from neuron_pipeline.stages.voxel_cleaning import VoxelCleaner
+from neuron_pipeline.stages.skeletonization import SkeletonExtractor, SWCWriter
+from neuron_pipeline.stages.centroid_extraction import CentroidExtractor, CentroidTable
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO,
@@ -216,5 +217,5 @@ def main():
     # trees dict will be passed to Phase 3 for centroid -> SWC mapping
 
 
-if __name__ == "__main__":
-    main()
+# if __name__ == "__main__":
+#     main()

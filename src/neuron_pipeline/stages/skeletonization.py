@@ -16,7 +16,7 @@ import numpy as np
 from typing import Tuple, Optional, Dict, Any, List
 from skimage.morphology import skeletonize
 from scipy.ndimage import distance_transform_edt
-from scipy.spatial import cKDTree
+from scipy.spatial import KDTree
 import networkx as nx
 import logging
 
@@ -98,7 +98,7 @@ class SkeletonExtractor:
         # ------------------------------------------------------------------
         self.logger.info("Computing distance transform...")
         sz, sy, sx = voxel_size_um
-        dist_um = distance_transform_edt(mask, sampling=(sz, sy, sx))
+        dist_um = distance_transform_edt(mask.astype(bool), sampling=(sz, sy, sx))
 
         # ------------------------------------------------------------------
         # Step 3: Extract voxel coordinates and radii
@@ -123,7 +123,7 @@ class SkeletonExtractor:
         # ------------------------------------------------------------------
         # Step 4: Build voxel-resolution graph
         # ------------------------------------------------------------------
-        G = self.skeleton_to_graph(skeleton_mask, voxel_size_um)
+        G = self.skeleton_to_graph(skeleton_mask, voxel_size_um, bbox_min_vox)
 
         # ------------------------------------------------------------------
         # Step 5: Topologically-correct graph compression
@@ -171,6 +171,7 @@ class SkeletonExtractor:
         self,
         skeleton_mask: np.ndarray,
         voxel_size_um: Tuple[float, float, float],
+        bbox_min_vox: Tuple[int, int, int] = (0, 0, 0),
     ) -> nx.Graph:
         """
         Build a voxel-resolution undirected graph from the skeleton mask.
@@ -186,10 +187,11 @@ class SkeletonExtractor:
         kd = cKDTree(skel_coords)
         G = nx.Graph()
         sz, sy, sx = voxel_size_um
+        minx, miny, minz = bbox_min_vox
 
         for i, coord in enumerate(skel_coords):
             z, y, x = coord
-            G.add_node(i, pos=(x * sx, y * sy, z * sz), voxel_pos=coord)
+            G.add_node(i, pos=((x + minx) * sx, (y + miny) * sy, (z + minz) * sz), voxel_pos=coord)
 
         for i, coord in enumerate(skel_coords):
             for j in kd.query_ball_point(coord, r=1.8):   # sqrt(3) + margin = 26-conn
@@ -357,7 +359,7 @@ class SkeletonExtractor:
         # Cumulative arc length
         cum = [0.0]
         for i in range(1, len(positions)):
-            cum.append(cum[-1] + np.linalg.norm(positions[i] - positions[i - 1]))
+            cum.append(cum[-1] + float(np.linalg.norm(positions[i] - positions[i - 1])))
 
         total = cum[-1]
         if total < spacing:

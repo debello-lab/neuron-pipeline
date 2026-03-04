@@ -1,8 +1,8 @@
 *.vsseg
 *.vsv
-
-# Ignore the VAST package folder and its contents
+*.egg-info/
 VAST_package_1_5_0/
 __pycache__/*
+*.pyc
 vast_export/*
 .*/*

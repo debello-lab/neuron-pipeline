@@ -1,7 +1,7 @@
 import sys
 import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from VastControlClass_exporting import VASTControlClass
+from vastpy.control.exporting import VASTControlClass
 import numpy as np
 import math
 

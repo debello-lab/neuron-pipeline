@@ -33,8 +33,8 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from extract_surfaces import SegmentSurfaceExtractor
-from segment_classifier import SegmentRegistry, SegmentInfo
+from neuron_pipeline.stages.extract_surfaces import SegmentSurfaceExtractor
+from neuron_pipeline.stages.segment_classifier import SegmentRegistry, SegmentInfo
 
 
 @dataclass
@@ -233,6 +233,9 @@ class CentroidExtractor:
         mask, bbox_min_vox, voxel_size_um, _ = result
 
         if mask is None or not np.any(mask):
+            return None
+        
+        if bbox_min_vox is None or voxel_size_um is None:
             return None
 
         # mask is (Z, Y, X); bbox_min_vox is (minx, miny, minz)

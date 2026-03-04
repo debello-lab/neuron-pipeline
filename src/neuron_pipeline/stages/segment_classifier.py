@@ -1,4 +1,4 @@
-from VastControlClass_exporting import VASTControlClass
+from vastpy.control.exporting import VASTControlClass
 from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, NamedTuple
 import re
@@ -83,7 +83,7 @@ class SegmentClassifier:
             if role == 'UNKNOWN':
                 registry.warnings.append(f"Unknown segment name: {name} (id={i})")
 
-            bbox = tuple(segment_data[i]['boundingbox']) if i < len(segment_data) else ()
+            bbox = tuple(segment_data[i]['boundingbox']) if i < len(segment_data) else (0, 0, 0, 0, 0, 0)
             registry.segments[name] = SegmentInfo(seg_id=i, name=name, role=role, bbox=bbox)
 
         # Helper: look up seg_id by name (-1 if missing)
@@ -96,6 +96,8 @@ class SegmentClassifier:
 
             if info.role == 'SYNAPSE':
                 m = self.patterns['SYNAPSE'].match(name)
+                if not m:
+                    continue
                 g = m.groups()  # ('A1', 'B1', 'P1', 'S1')
                 axon_name    = g[0]
                 bouton_name  = g[0] + g[1]
@@ -110,6 +112,8 @@ class SegmentClassifier:
 
             elif info.role == 'CONTACT':
                 m = self.patterns['CONTACT'].match(name)
+                if not m:
+                    continue
                 g = m.groups()  # ('A6', 'B1', 'X1')
                 axon_name   = g[0]
                 bouton_name = g[0] + g[1]
@@ -132,15 +136,19 @@ class SegmentClassifier:
         for name, info in registry.segments.items():
             if info.role == 'BOUTON':
                 m = self.patterns['BOUTON'].match(name)
+                if not m: continue
                 name_derived_parent[name] = m.group(1)           # AXON
             elif info.role == 'POST_SYN':
                 m = self.patterns['POST_SYN'].match(name)
+                if not m: continue
                 name_derived_parent[name] = m.group(1) + m.group(2)  # BOUTON
             elif info.role == 'SYNAPSE':
                 m = self.patterns['SYNAPSE'].match(name)
+                if not m: continue
                 name_derived_parent[name] = m.group(1) + m.group(2) + m.group(3)  # POST_SYN
             elif info.role == 'CONTACT':
                 m = self.patterns['CONTACT'].match(name)
+                if not m: continue
                 name_derived_parent[name] = m.group(1) + m.group(2)  # BOUTON
 
         for name, expected_parent_name in name_derived_parent.items():

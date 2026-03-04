@@ -16,7 +16,7 @@ import sys
 import logging
 from datetime import datetime
 from pathlib import Path
-from VastControlClass_exporting import VASTControlClass
+from vastpy.control.exporting import VASTControlClass
 
 
 class SegmentSurfaceExtractor:
@@ -47,8 +47,9 @@ class SegmentSurfaceExtractor:
         self._setup_logging()
         
         # Cache dataset info
-        self.dataset_info = None
+        self.dataset_info: Dict[str, Any] = None  # type: ignore
         self._load_dataset_info()
+        assert self.dataset_info is not None, "Dataset info must be loaded"
         
         # Memory management settings (can be tuned)
         self.max_block_voxels = 512 ** 3  # ~134M voxels max per block (conservative)
@@ -103,14 +104,17 @@ class SegmentSurfaceExtractor:
         self.logger.info(f"Voxel size: {info['voxelsizex']:.3f} x {info['voxelsizey']:.3f} x {info['voxelsizez']:.3f} nm")
         
         # Get MIP scale factors for segmentation layer
-        selected_layer, selected_em_layer, selected_segment_layer = self.vast.get_selected_layernr()
-        if selected_layer:
-            seg_layer = selected_layer
-            self.mip_factors = self.vast.get_mipmap_scale_factors(seg_layer)
-            self.logger.debug(f"Segmentation layer: {seg_layer}")
-        else:
-            self.mip_factors = None
-            self.logger.warning("Could not retrieve MIP scale factors")
+        layer_info  = self.vast.get_selected_layernr()
+        if layer_info is not None:
+            selected_layer, selected_em_layer, selected_segment_layer = layer_info
+            if selected_layer:
+                seg_layer = selected_layer
+                self.mip_factors = self.vast.get_mipmap_scale_factors(seg_layer)
+                self.logger.debug(f"Segmentation layer: {seg_layer}")
+            else:
+                self.mip_factors = None
+                self.logger.warning("Could not retrieve MIP scale factors")
+        
     
     def _set_socket_timeout(self, timeout_seconds):
         """Temporarily change socket timeout for large data transfers."""
@@ -231,7 +235,7 @@ class SegmentSurfaceExtractor:
         self,
         bbox_size: list,
         miplevel: int,
-        max_voxels_per_block: int = None
+        max_voxels_per_block: int
         ) -> Tuple[int, int, int]:
         """
         Calculate optimal block dimensions for processing.
@@ -296,16 +300,21 @@ class SegmentSurfaceExtractor:
         Returns:
             Tuple of (merged_vertices, merged_faces)
         """
+
+        assert faces2 is not None and faces1 is not None
         # Handle empty cases
-        if verts1 is None or len(verts1) == 0:
-            if verts2 is None or len(verts2) == 0:
+        if verts1 is None or (isinstance(verts1, np.ndarray) and len(verts1) == 0):
+            if verts2 is None or (isinstance(verts2, np.ndarray) and len(verts2) == 0):
                 return np.array([]), np.array([])
+            assert verts2 is not None
             return verts2.copy(), faces2.copy()
         
-        if verts2 is None or len(verts2) == 0:
+        if verts2 is None or (isinstance(verts2, np.ndarray) and len(verts2) == 0):
+            assert verts1 is not None
             return verts1.copy(), faces1.copy()
         
         # Merge vertices
+        assert verts1 is not None and verts2 is not None
         merged_verts = np.vstack([verts1, verts2])
         
         # Offset face indices for second mesh
@@ -489,7 +498,7 @@ class SegmentSurfaceExtractor:
         
         # Calculate block dimensions
         region_size = [maxx - minx + 1, maxy - miny + 1, maxz - minz + 1]
-        blocks_x, blocks_y, blocks_z = self._calculate_block_dimensions(region_size, miplevel)
+        blocks_x, blocks_y, blocks_z = self._calculate_block_dimensions(region_size, miplevel, self.max_block_voxels)
         
         total_blocks = blocks_x * blocks_y * blocks_z
         self.logger.info(f"Processing {total_blocks} blocks total")
@@ -539,7 +548,7 @@ class SegmentSurfaceExtractor:
                                 block_verts, block_faces
                             )
                             self.logger.info(f"  Block contributed {len(block_verts):,} vertices, " +
-                                        f"{len(block_faces):,} faces")
+                                        f"{len(block_faces) if block_faces is not None else 0:,} faces")
                             self.logger.info(f"  Total so far: {len(merged_verts):,} vertices, " +
                                         f"{len(merged_faces):,} faces")
             
@@ -549,6 +558,7 @@ class SegmentSurfaceExtractor:
                 self.logger.error("No geometry generated from any block")
                 return None, None
             
+            assert merged_faces is not None
             self.logger.info(f"Final mesh: {len(merged_verts):,} vertices, {len(merged_faces):,} faces")
             
             return merged_verts, merged_faces
@@ -623,6 +633,7 @@ class SegmentSurfaceExtractor:
                 self.logger.error("Surface extraction produced no geometry")
                 return None, None, None
             
+            assert faces is not None
             # Save to file
             output_path = self._save_mesh(
                 vertices, 
@@ -636,7 +647,7 @@ class SegmentSurfaceExtractor:
             self.logger.info("=" * 80)
             self.logger.info("Extraction completed successfully!")
             self.logger.info(f"  Vertices: {len(vertices):,}")
-            self.logger.info(f"  Faces: {len(faces):,}")
+            self.logger.info(f"  Faces: {len(faces) if faces is not None else 0:,}")
             self.logger.info(f"  Output: {output_path}")
             self.logger.info("=" * 80)
             
@@ -990,7 +1001,7 @@ class SegmentSurfaceExtractor:
         
         if seg_image is None:
             self.logger.error("Failed to load segmentation data from VAST")
-            return None, None, None
+            return np.array([]), (0, 0, 0), (0.0, 0.0, 0.0) #Tuple[np.ndarray, Tuple[int, int, int], Tuple[float, float, float]]
         
         self.logger.info(f"Loaded volume shape: {seg_image.shape}")
         
@@ -1230,11 +1241,11 @@ def main():
                 print(f"\nExtracting segment {segment_id}...")
                 print("This may take several minutes for large neurons...\n")
                 
-                vertices, faces, output_path = extractor.extract_segment(
+                mask, origin, voxel_size, output_path = extractor.extract_segment_voxel(
                     segment_id=segment_id,
-                    miplevel=1,  # Full resolution = 0, Half resolution = 1, Quarter resolution = 2
-                    close_surfaces=False,
-                    output_format='swc'
+                    miplevel=1,  # Half resolution
+                    padding=1,
+                    output_filename=f"segment_{segment_id:04d}_mask.npy"
                 )
         
         else:
@@ -1242,8 +1253,10 @@ def main():
             extractor = SegmentSurfaceExtractor(vast, output_dir="./vast_export")
             
             num_segments = vast.get_number_of_segments()
-            for id in range(1,num_segments):
-                segment_id = id
+            if num_segments is None:
+                print("ERROR: Could not retrieve number of segments")
+                return
+            for segment_id in range(1, num_segments + 1):
                 
                 print(f"\nExtracting segment {segment_id}...")
                 print("This may take several minutes for large neurons...\n")
@@ -1255,7 +1268,7 @@ def main():
                     output_format='obj'
                 )
                 
-                if vertices is not None:
+                if vertices is not None and faces is not None:
                     print("\n" + "=" * 80)
                     print("SUCCESS!")
                     print("=" * 80)
