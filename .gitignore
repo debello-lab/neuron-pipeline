@@ -5,5 +5,4 @@
 VAST_package_1_5_0/
 __pycache__/*
 vast_export/*
-.claude/*
-.venv/*
+.*/*

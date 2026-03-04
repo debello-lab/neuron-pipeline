@@ -7,7 +7,6 @@ Designed for neurons ranging from thousands to tens of millions of voxels.
 Functions for extracting obj/ply meshes as well as voxel masks for skeletonization.
 
 Author: Nicolas Randazzo
-Date: 2026-02-17
 """
 
 import numpy as np

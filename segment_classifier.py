@@ -123,7 +123,7 @@ class SegmentClassifier:
         # --- Pass 3: cross-check names vs VAST hierarchy -------------------------
         # Each segment_data entry has hierarchy[0] = parent seg_id.
         # Derive the expected parent from the name and compare.
-        vast_parent_of = {}  # seg_id → parent seg_id in VAST tree
+        vast_parent_of = {}  # seg_id -> parent seg_id in VAST tree
         for sd in segment_data:
             vast_parent_of[sd['id']] = sd['hierarchy'][0]
 
@@ -155,7 +155,7 @@ class SegmentClassifier:
                     else f"seg#{vast_parent_id}"
                 )
                 registry.warnings.append(
-                    f"HIERARCHY MISMATCH: {name} — name implies parent "
+                    f"HIERARCHY MISMATCH: {name} -- name implies parent "
                     f"{expected_parent_name}, but VAST tree says parent is "
                     f"{vast_parent_name} (id={vast_parent_id})")
 

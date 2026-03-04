@@ -9,7 +9,6 @@ This module provides cleaning operations for both voxel masks and surface meshes
 - Remove spurious branches
 
 Author: Nicolas Randazzo
-Date: 2026-02-11
 """
 
 import numpy as np
