@@ -14,8 +14,8 @@ Fallback : use the bounding-box centre (fast, ~equal for compact segments)
 
 Output
 ------
-CentroidTable  — in-memory dataclass, iterable over CentroidEntry rows.
-write_csv()    — writes centroids.csv for Phase 3 consumption.
+CentroidTable  -- in-memory dataclass, iterable over CentroidEntry rows.
+write_csv()    -- writes centroids.csv for Phase 3 consumption.
 
 CSV columns
 -----------
@@ -84,7 +84,7 @@ class CentroidTable:
         return path
 
 
-# AXON and POST_SYN get full SWC files in Phase 1 — their locations are
+# AXON and POST_SYN get full SWC files in Phase 1 -- their locations are
 # captured by the skeleton.  BOUTON / SYNAPSE / CONTACT are compact objects
 # whose 3-D position is fully described by a single centroid point.
 _TARGET_ROLES = ('BOUTON', 'SYNAPSE', 'CONTACT')
@@ -149,7 +149,7 @@ class CentroidExtractor:
         for info in targets:
             role_counts[info.role] = role_counts.get(info.role, 0) + 1
         self.logger.info(
-            f"Phase 2: {len(targets)} segments to process — "
+            f"Phase 2: {len(targets)} segments to process -- "
             + ", ".join(f"{r}: {n}" for r, n in sorted(role_counts.items()))
         )
 

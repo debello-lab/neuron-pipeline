@@ -159,7 +159,7 @@ def run_phase2(
         miplevel   : MIP level for voxel extraction (0 = full resolution).
 
     Returns:
-        CentroidTable — in-memory table, also written to
+        CentroidTable -- in-memory table, also written to
         <output_dir>/centroids.csv for Phase 3 consumption.
     """
     surface_extractor = SegmentSurfaceExtractor(vast, output_dir)
@@ -209,7 +209,7 @@ def main():
         registry=registry,
         vast=classifier.vast,
         output_dir="./vast_export",
-        miplevel=0,  # MIP 0 for small markers — MIP 1 may reduce to too few voxels
+        miplevel=0,  # MIP 0 for small markers -- MIP 1 may reduce to too few voxels
     )
     print(centroids)
 
