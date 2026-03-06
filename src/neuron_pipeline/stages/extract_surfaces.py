@@ -1250,13 +1250,13 @@ def main():
         
         else:
             # Create extractor
-            extractor = SegmentSurfaceExtractor(vast, output_dir="./vast_export")
+            extractor = SegmentSurfaceExtractor(vast, output_dir="../../../vast_export")
             
             num_segments = vast.get_number_of_segments()
             if num_segments is None:
                 print("ERROR: Could not retrieve number of segments")
                 return
-            for segment_id in range(1, num_segments + 1):
+            for segment_id in range(1, num_segments):
                 
                 print(f"\nExtracting segment {segment_id}...")
                 print("This may take several minutes for large neurons...\n")

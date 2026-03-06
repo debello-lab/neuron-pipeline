@@ -85,7 +85,7 @@ class SkeletonExtractor:
         # Step 1: Skeletonize (Lee 1994 algorithm -- guaranteed 1-voxel-wide)
         # ------------------------------------------------------------------
         self.logger.info("Computing skeleton...")
-        skeleton_mask = skeletonize(mask.astype(bool)) > 0
+        skeleton_mask = skeletonize(mask.astype(bool), method='lee') > 0
         skeleton_voxel_count = int(np.sum(skeleton_mask))
         stats['skeleton_voxel_count'] = skeleton_voxel_count
         self.logger.info(
@@ -116,7 +116,7 @@ class SkeletonExtractor:
 
         stats['skeleton_points'] = len(skel_coords)
         self.logger.info(
-            f"Radii: {radii_um.min():.3f} – {radii_um.max():.3f} um "
+            f"Radii: {radii_um.min():.3f} - {radii_um.max():.3f} um "
             f"(median {np.median(radii_um):.3f} um, floor {radius_floor:.3f} um)"
         )
 
@@ -184,7 +184,7 @@ class SkeletonExtractor:
         if len(skel_coords) == 0:
             return nx.Graph()
 
-        kd = cKDTree(skel_coords)
+        kd = KDTree(skel_coords)
         G = nx.Graph()
         sz, sy, sx = voxel_size_um
         minx, miny, minz = bbox_min_vox
