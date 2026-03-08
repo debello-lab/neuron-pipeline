@@ -478,7 +478,7 @@ class SegmentSurfaceExtractor:
             maxz = maxz // mip_scale[2]
         
         # Get dataset bounds
-        mip_scale_val = mip_scale if isinstance(mip_scale, list) else [1, 1, 1]
+        mip_scale_val = list(mip_scale) if mip_scale is not None else [1, 1, 1]
         max_x_bound = (self.dataset_info['datasizex'] >> miplevel) - 1
         max_y_bound = (self.dataset_info['datasizey'] >> miplevel) - 1
         max_z_bound = self.dataset_info['datasizez'] - 1
@@ -694,7 +694,7 @@ class SegmentSurfaceExtractor:
             minz = minz // mip_scale[2]
             maxz = maxz // mip_scale[2]
         
-        mip_scale_val = mip_scale if isinstance(mip_scale, list) else [1, 1, 1]
+        mip_scale_val = list(mip_scale) if mip_scale is not None else [1, 1, 1]
         max_x_bound = (self.dataset_info['datasizex'] >> miplevel) - 1
         max_y_bound = (self.dataset_info['datasizey'] >> miplevel) - 1
         max_z_bound = self.dataset_info['datasizez'] - 1
@@ -960,7 +960,7 @@ class SegmentSurfaceExtractor:
             minz = minz // mip_scale[2]
             maxz = maxz // mip_scale[2]
         
-        mip_scale_val = mip_scale if isinstance(mip_scale, list) else [1, 1, 1]
+        mip_scale_val = list(mip_scale) if mip_scale is not None else [1, 1, 1]
         max_x_bound = (self.dataset_info['datasizex'] >> miplevel) - 1
         max_y_bound = (self.dataset_info['datasizey'] >> miplevel) - 1
         max_z_bound = self.dataset_info['datasizez'] - 1
