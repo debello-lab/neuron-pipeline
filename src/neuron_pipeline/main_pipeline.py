@@ -9,13 +9,14 @@ Pipeline phases:
   Phase 0  Segment classification & connectivity table
   Phase 1  Voxel extraction -> cleaning -> skeletonization -> SWC
   Phase 2  Synapse / bouton centroid extraction        
-  Phase 3  Map centroids to SWC cable locations        (TODO)
-  Phase 4  Connectivity CSV + Arbor recipe generation  (TODO)
+  Phase 3  Map centroids to SWC cable locations        
+  Phase 4  Connectivity CSV + Arbor recipe generation  
 """
 from pathlib import Path
 from typing import Dict, Tuple
 import logging
 
+import numpy as np
 import networkx as nx
 
 from vastpy.control.exporting import VASTControlClass
@@ -25,6 +26,8 @@ from neuron_pipeline.stages.extract_surfaces import SegmentSurfaceExtractor
 from neuron_pipeline.stages.voxel_cleaning import VoxelCleaner
 from neuron_pipeline.stages.skeletonization import SkeletonExtractor, SWCWriter
 from neuron_pipeline.stages.centroid_extraction import CentroidExtractor, CentroidTable
+from neuron_pipeline.stages.centroid_mapper import CentroidMapper, CableMappingTable
+from neuron_pipeline.stages.connectivity_builder import ConnectivityBuilder, ConnectivityOutput
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO,
@@ -82,7 +85,7 @@ def run_phase1(
             miplevel=miplevel,
             padding=padding,
         )
-        if mask is None:
+        if mask is None or voxel_size is None or bbox_min is None:
             logger.error(f"  Voxel extraction failed -- skipping {name}")
             continue
 
@@ -188,6 +191,107 @@ def run_phase2(
     return table
 
 
+#  Phase 3 
+
+def run_phase3(
+    centroid_table: CentroidTable,
+    trees: Dict[str, Tuple[nx.DiGraph, str]],
+    registry: SegmentRegistry,
+    output_dir: str = "./vast_export",
+    warn_distance_um: float = 5.0,
+) -> CableMappingTable:
+    """
+    Phase 3: Map BOUTON / SYNAPSE / CONTACT centroids onto SWC cable trees.
+
+    For each centroid, finds the nearest point on the relevant skeleton
+    and records the edge + arc-fraction position for use in Phase 4.
+
+    Args:
+        centroid_table   : Output of Phase 2.
+        trees            : Output of Phase 1 -- dict: cell_name -> (tree, swc_path).
+        registry         : SegmentRegistry from Phase 0.
+        output_dir       : Base output directory; cable_mappings.csv written here.
+        warn_distance_um : Warn when nearest cable point exceeds this distance.
+
+    Returns:
+        CableMappingTable -- in-memory table, also written to
+        <output_dir>/cable_mappings.csv for Phase 4 consumption.
+    """
+    mapper = CentroidMapper()
+
+    mapping_table = mapper.map_centroids(
+        centroid_table=centroid_table,
+        trees=trees,
+        registry=registry,
+        warn_distance_um=warn_distance_um,
+    )
+
+    csv_path = str(Path(output_dir) / "cable_mappings.csv")
+    mapping_table.write_csv(csv_path)
+    logger.info(f"Phase 3: mappings written -> {csv_path}  ({len(mapping_table)} entries)")
+
+    # Summary by role
+    for role in ('BOUTON', 'SYNAPSE', 'CONTACT'):
+        entries = mapping_table.by_role(role)
+        if entries:
+            distances = [e.distance_um for e in entries]
+            logger.info(
+                f"  {role}: {len(entries)} mapped  "
+                f"dist min={min(distances):.2f} median={np.median(distances):.2f} "
+                f"max={max(distances):.2f} µm"
+            )
+
+    return mapping_table
+
+
+#  Phase 4 
+
+def run_phase4(
+    registry: SegmentRegistry,
+    trees: Dict[str, Tuple[nx.DiGraph, str]],
+    mapping_table: CableMappingTable,
+    output_dir: str = "./vast_export",
+    syn_mechanism: str = "expsyn",
+) -> ConnectivityOutput:
+    """
+    Phase 4: Build connectivity.csv and arbor_recipe.json.
+
+    Consumes:
+      - Phase 0 registry  (connectivity / contact wiring tables)
+      - Phase 1 trees     (SWC file paths, skeleton graphs)
+      - Phase 3 mappings  (cable locations for each centroid)
+
+    Produces:
+      <output_dir>/connectivity.csv   — full edge list for analysis
+      <output_dir>/arbor_recipe.json  — Arbor-ready network description
+
+    Args:
+        registry      : SegmentRegistry from Phase 0.
+        trees         : Phase 1 output — cell_name -> (tree, swc_path).
+        mapping_table : Phase 3 output — CableMappingTable.
+        output_dir    : Base output directory.
+        syn_mechanism : Arbor synapse mechanism name (default: 'expsyn').
+
+    Returns:
+        ConnectivityOutput — in-memory connectivity table.
+    """
+    builder = ConnectivityBuilder()
+    connectivity, csv_path, recipe_path = builder.build(
+        registry=registry,
+        trees=trees,
+        mapping_table=mapping_table,
+        output_dir=output_dir,
+        syn_mechanism=syn_mechanism,
+    )
+
+    synapses = [r for r in connectivity.rows if r.connection_type == "synapse"]
+    contacts = [r for r in connectivity.rows if r.connection_type == "contact"]
+    logger.info(
+        f"Phase 4 complete: {len(synapses)} synapses, {len(contacts)} contacts  "
+        f"-> {csv_path}  {recipe_path}"
+    )
+    return connectivity
+
 # Main entry point 
 
 def main():
@@ -211,10 +315,31 @@ def main():
         output_dir="./vast_export",
         miplevel=0,  # MIP 0 for small markers -- MIP 1 may reduce to too few voxels
     )
-    print(centroids)
+    # print(centroids)
 
-    # Phase 3: map centroids to SWCs
-    # trees dict will be passed to Phase 3 for centroid -> SWC mapping
+    # Phase 3: Map centroids onto skeleton cable
+    mappings = run_phase3(
+        centroid_table=centroids,
+        trees=trees,
+        registry=registry,
+        output_dir="./vast_export",
+        warn_distance_um=5.0,
+    )
+
+    connectivity = run_phase4(
+        registry=registry,
+        trees=trees,
+        mapping_table=mappings,
+        output_dir="./vast_export",
+        syn_mechanism="expsyn",
+    )
+
+    logger.info(
+        f"Pipeline complete. "
+        f"Outputs in ./vast_export/  "
+        f"({len(trees)} SWC files, "
+        f"{len(connectivity)} connectivity rows)"
+    )
 
 
 # if __name__ == "__main__":
