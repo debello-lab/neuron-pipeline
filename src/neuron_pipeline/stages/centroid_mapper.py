@@ -1,0 +1,422 @@
+"""
+Centroid -> SWC Cable Mapping
+Neural Reconstruction Pipeline -- Phase 3
+
+For each BOUTON, SYNAPSE, and CONTACT centroid (from Phase 2) this module
+finds the nearest point on the relevant skeleton cable (from Phase 1) and
+records the location as:
+
+    (cell_name, edge_u, edge_v, arc_fraction, distance_um)
+
+where
+    cell_name    - name of the AXON or POST_SYN cell the centroid belongs to
+    edge_u/v     - the two endpoint node IDs of the nearest skeleton edge
+    arc_fraction - position along that edge, 0.0 = u-end, 1.0 = v-end
+    distance_um  - Euclidean distance from centroid to the nearest cable point
+
+The mapping is used in Phase 4 to build the Arbor connectivity recipe.
+
+Design
+------
+The skeleton tree produced by Phase 1 stores geometry at two levels:
+  - Structural nodes (junctions + endpoints) with node attribute ``pos``
+  - Intermediate samples stored on edges as ``edge['points']``
+
+To find the nearest cable point we:
+  1. Build a KDTree from ALL sample positions (nodes + edge intermediates).
+  2. Query each centroid against the tree (O(log N) per centroid).
+  3. Resolve the hit back to its parent edge and arc-fraction.
+"""
+
+import csv
+import logging
+import numpy as np
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import networkx as nx
+from scipy.spatial import KDTree
+
+from neuron_pipeline.stages.centroid_extraction import CentroidEntry, CentroidTable
+from neuron_pipeline.stages.segment_classifier import SegmentRegistry
+
+
+# ---------------------------------------------------------------------------
+# Data model
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CableMappingEntry:
+    # Centroid identity
+    centroid_name: str          # e.g. "A1B2"  (BOUTON)
+    centroid_role: str          # BOUTON | SYNAPSE | CONTACT
+    cx_um: float
+    cy_um: float
+    cz_um: float
+
+    # Which skeleton this was mapped onto
+    cell_name: str              # e.g. "A1"  (AXON or POST_SYN)
+    cell_role: str              # AXON | POST_SYN
+
+    # Location on the cable
+    edge_u: int                 # upstream node ID of nearest edge
+    edge_v: int                 # downstream node ID of nearest edge
+    arc_fraction: float         # 0.0 = at node u, 1.0 = at node v
+    nearest_x_um: float         # physical position of nearest cable point
+    nearest_y_um: float
+    nearest_z_um: float
+    distance_um: float          # Euclidean distance centroid -> cable
+
+
+@dataclass
+class CableMappingTable:
+    entries: List[CableMappingEntry] = field(default_factory=list)
+
+    def add(self, entry: CableMappingEntry) -> None:
+        self.entries.append(entry)
+
+    def by_cell(self, cell_name: str) -> List[CableMappingEntry]:
+        return [e for e in self.entries if e.cell_name == cell_name]
+
+    def by_role(self, role: str) -> List[CableMappingEntry]:
+        return [e for e in self.entries if e.centroid_role == role]
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+    def write_csv(self, path: str) -> str:
+        """Write mappings to CSV. Returns path."""
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        fieldnames = [
+            'centroid_name', 'centroid_role', 'cx_um', 'cy_um', 'cz_um',
+            'cell_name', 'cell_role',
+            'edge_u', 'edge_v', 'arc_fraction',
+            'nearest_x_um', 'nearest_y_um', 'nearest_z_um',
+            'distance_um',
+        ]
+        with open(path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for e in self.entries:
+                row = asdict(e)
+                for key in ('cx_um', 'cy_um', 'cz_um',
+                            'nearest_x_um', 'nearest_y_um', 'nearest_z_um',
+                            'distance_um'):
+                    row[key] = f"{row[key]:.4f}"
+                row['arc_fraction'] = f"{row['arc_fraction']:.6f}"
+                writer.writerow(row)
+        return path
+
+
+# ---------------------------------------------------------------------------
+# Per-tree index
+# ---------------------------------------------------------------------------
+
+class _TreeIndex:
+    """
+    Spatial index over all sample points of a single skeleton tree.
+
+    Stores every node position AND every intermediate edge point so that
+    nearest-cable queries resolve to a specific (edge_u, edge_v, arc_fraction).
+    """
+
+    def __init__(self, tree: nx.DiGraph) -> None:
+        self._tree = tree
+        self._samples: List[Tuple[float, float, float]] = []
+        # For each sample: which edge does it belong to, and what fraction?
+        self._edge_u:   List[int]   = []
+        self._edge_v:   List[int]   = []
+        self._arc_frac: List[float] = []
+        self._build(tree)
+        pts = np.array(self._samples, dtype=np.float64)
+        self._kdtree = KDTree(pts) if len(pts) > 0 else None
+
+    # ------------------------------------------------------------------
+
+    def _build(self, tree: nx.DiGraph) -> None:
+        """Populate sample list from node positions and edge intermediate points."""
+        for u, v, data in tree.edges(data=True):
+            u_pos = np.array(tree.nodes[u]['pos'], dtype=np.float64)
+            v_pos = np.array(tree.nodes[v]['pos'], dtype=np.float64)
+            edge_len = float(data.get('length', 0.0))
+            mid_pts  = data.get('points', [])
+            mid_rads = data.get('radii',  [])   # noqa: kept for completeness
+
+            # All positions along this edge in order: u -> intermediates -> v
+            ordered_positions = [u_pos] + [np.array(p) for p in mid_pts] + [v_pos]
+
+            # Compute cumulative arc lengths
+            cum = [0.0]
+            for i in range(1, len(ordered_positions)):
+                seg = float(np.linalg.norm(ordered_positions[i] - ordered_positions[i - 1]))
+                cum.append(cum[-1] + seg)
+            total = cum[-1] if cum[-1] > 0 else edge_len  # fall back to stored length
+
+            # Add u node (fraction 0)
+            self._add(u_pos, u, v, 0.0)
+
+            # Add intermediate samples
+            for k, pt in enumerate(mid_pts):
+                frac = (cum[k + 1] / total) if total > 0 else (k + 1) / (len(mid_pts) + 1)
+                self._add(np.array(pt), u, v, float(frac))
+
+            # Add v node (fraction 1.0) -- will appear again as u of next edge,
+            # that's fine; duplicate positions in kd-tree are harmless
+            self._add(v_pos, u, v, 1.0)
+
+    def _add(self, pos: np.ndarray, u: int, v: int, frac: float) -> None:
+        self._samples.append(tuple(pos))
+        self._edge_u.append(u)
+        self._edge_v.append(v)
+        self._arc_frac.append(frac)
+
+    # ------------------------------------------------------------------
+
+    def query(
+        self, point: np.ndarray
+    ) -> Optional[Tuple[int, int, float, np.ndarray, float]]:
+        """
+        Find the nearest cable point to *point*.
+
+        Returns
+        -------
+        (edge_u, edge_v, arc_fraction, nearest_pos, distance_um)
+        or None if the tree is empty.
+        """
+        if self._kdtree is None:
+            return None
+        dist, idx = self._kdtree.query(point)
+        u    = self._edge_u[idx]
+        v    = self._edge_v[idx]
+        frac = self._arc_frac[idx]
+        nearest_pos = np.array(self._samples[idx])
+        return u, v, frac, nearest_pos, float(dist)
+
+
+# ---------------------------------------------------------------------------
+# Mapper
+# ---------------------------------------------------------------------------
+
+# Which skeleton role does each centroid/segment role map onto?
+# A BOUTON/SYNAPSE/CONTACT belongs to an axon; the companion POST_SYN
+# dendrite is the other side of the synapse.
+_CENTROID_TO_SKELETON: Dict[str, Tuple[str, ...]] = {
+    'BOUTON':  ('AXON',),
+    'SYNAPSE': ('AXON',),
+    'CONTACT': ('AXON',),
+    'POST_SYN': ('POST_SYN',),
+}
+
+
+class CentroidMapper:
+    """
+    Map Phase 2 centroids onto Phase 1 skeleton trees.
+
+    For each centroid the relevant parent cell name is derived from the
+    segment naming convention (A1B2 -> parent AXON is A1, etc.) using
+    the SegmentRegistry built in Phase 0.
+    """
+
+    def __init__(self, logger: Optional[logging.Logger] = None) -> None:
+        self.logger = logger or logging.getLogger(__name__)
+
+    # ------------------------------------------------------------------
+    # Public entry point
+    # ------------------------------------------------------------------
+
+    def map_centroids(
+        self,
+        centroid_table: CentroidTable,
+        trees: Dict[str, Tuple[nx.DiGraph, str]],
+        registry: SegmentRegistry,
+        warn_distance_um: float = 5.0,
+        extra_entries: Optional[List] = None,
+    ) -> CableMappingTable:
+        """
+        Map all centroids in *centroid_table* to their nearest skeleton edge.
+        Also maps POST_SYN segment bounding-box centers onto their own skeletons.
+        Args:
+            centroid_table   : Output of Phase 2.
+            trees            : Output of Phase 1 -- dict: cell_name -> (tree, swc_path).
+            registry         : SegmentRegistry from Phase 0.
+            warn_distance_um : Log a warning when the nearest point is further
+                               than this value (possible mis-assignment).
+            extra_entries    : Optional list of additional CentroidEntry objects
+
+        Returns:
+            CableMappingTable with one entry per centroid.
+        """
+        # Pre-build spatial indices -- one per skeleton tree
+        self.logger.info(f"Building spatial indices for {len(trees)} skeleton trees...")
+        indices: Dict[str, _TreeIndex] = {
+            name: _TreeIndex(tree)
+            for name, (tree, _) in trees.items()
+        }
+
+        post_syn_entries = []
+        for name, info in registry.segments.items():
+            if info.role != 'POST_SYN':
+                continue
+            if name not in trees:
+                continue # no skeleton for this cell
+            bbox = info.bbox
+            if not bbox or len(bbox) < 6 or bbox[0] < 0:
+                continue
+            # use bbox center in voxels; need um
+            tree_graph ,_ = trees[name]
+            roots = [n for n in tree_graph.nodes() if tree_graph.in_degree(n) == 0]
+            if not roots:
+                continue
+            root_pos = tree_graph.nodes[roots[0]]['pos']
+            post_syn_entries.append(CentroidEntry(
+                name=name,
+                seg_id=info.seg_id,
+                role='POST_SYN',
+                cx_um=float(root_pos[0]),
+                cy_um=float(root_pos[1]),
+                cz_um=float(root_pos[2]),
+                method='root_proxy',
+            ))
+
+        all_entries = list(centroid_table.entries) + post_syn_entries + (extra_entries or [])
+
+        mapping_table = CableMappingTable()
+        n_ok = n_no_tree = n_no_cell = 0
+
+        for entry in all_entries:
+            result = self._map_one(
+                entry, indices, registry, warn_distance_um
+            )
+            if result == 'no_cell':
+                n_no_cell += 1
+            elif result == 'no_tree':
+                n_no_tree += 1
+            else:
+                mapping_table.add(result)
+                n_ok += 1
+
+        self.logger.info(
+            f"Phase 3 complete: {n_ok} mapped, "
+            f"{n_no_tree} skipped (no skeleton), "
+            f"{n_no_cell} skipped (no parent cell in registry)"
+        )
+        return mapping_table
+
+    # ------------------------------------------------------------------
+    # Per-centroid logic
+    # ------------------------------------------------------------------
+
+    def _map_one(
+        self,
+        entry: CentroidEntry,
+        indices: Dict[str, _TreeIndex],
+        registry: SegmentRegistry,
+        warn_distance_um: float,
+    ):
+        """
+        Map a single centroid. Returns a CableMappingEntry or a string error code.
+        """
+        # Derive the parent cell name from the segment registry
+        cell_name, cell_role = self._resolve_parent_cell(entry, registry)
+        if cell_name is None or cell_role is None:
+            self.logger.debug(
+                f"  {entry.name}: cannot resolve parent cell -- skipped"
+            )
+            return 'no_cell'
+
+        idx = indices.get(cell_name)
+        if idx is None:
+            self.logger.debug(
+                f"  {entry.name}: no skeleton for {cell_name} -- skipped"
+            )
+            return 'no_tree'
+
+        point = np.array([entry.cx_um, entry.cy_um, entry.cz_um], dtype=np.float64)
+        result = idx.query(point)
+        if result is None:
+            return 'no_tree'
+
+        u, v, arc_frac, nearest_pos, dist = result
+
+        if dist > warn_distance_um:
+            self.logger.warning(
+                f"  {entry.name}: nearest cable point is {dist:.2f} µm away "
+                f"(>{warn_distance_um} µm -- check annotation or skeleton)"
+            )
+
+        return CableMappingEntry(
+            centroid_name=entry.name,
+            centroid_role=entry.role,
+            cx_um=entry.cx_um,
+            cy_um=entry.cy_um,
+            cz_um=entry.cz_um,
+            cell_name=cell_name,
+            cell_role=cell_role,
+            edge_u=int(u),
+            edge_v=int(v),
+            arc_fraction=float(arc_frac),
+            nearest_x_um=float(nearest_pos[0]),
+            nearest_y_um=float(nearest_pos[1]),
+            nearest_z_um=float(nearest_pos[2]),
+            distance_um=dist,
+        )
+
+    # ------------------------------------------------------------------
+    # Parent-cell resolution
+    # ------------------------------------------------------------------
+
+    def _resolve_parent_cell(
+        self,
+        entry: CentroidEntry,
+        registry: SegmentRegistry,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Derive the parent skeleton cell name from the centroid's segment name.
+
+        Naming convention (from segment_classifier.py patterns):
+            BOUTON   A1B2      -> parent AXON  A1
+            SYNAPSE  A1B2P1S1  -> parent AXON  A1  (mapped onto the axon)
+            CONTACT  A1B2X1    -> parent AXON  A1
+
+        POST_SYN segments (A1B2P1) are skeletonized in Phase 1 as their own
+        cell.  Synapses are associated with the AXON side here; the Phase 4
+        connectivity builder will link both sides.
+
+        Returns (cell_name, cell_role) or (None, None) if not found.
+        """
+        seg_info = registry.segments.get(entry.name)
+        if seg_info is None:
+            return None, None
+
+        role = seg_info.role
+
+        if role == 'BOUTON':
+            # A1B2 -> axon = A1
+            axon_name = self._axon_prefix(entry.name)
+            if axon_name and axon_name in registry.segments:
+                return axon_name, 'AXON'
+
+        elif role == 'SYNAPSE':
+            # A1B2P1S1 -> axon = A1
+            axon_name = self._axon_prefix(entry.name)
+            if axon_name and axon_name in registry.segments:
+                return axon_name, 'AXON'
+
+        elif role == 'CONTACT':
+            # A1B2X1 -> axon = A1
+            axon_name = self._axon_prefix(entry.name)
+            if axon_name and axon_name in registry.segments:
+                return axon_name, 'AXON'
+        elif role == 'POST_SYN':
+            if entry.name in registry.segments:
+                return entry.name, 'POST_SYN'
+
+        return None, None
+
+    @staticmethod
+    def _axon_prefix(name: str) -> Optional[str]:
+        """Extract the A<n> prefix from any segment name."""
+        import re
+        m = re.match(r'^(A\d+)', name)
+        return m.group(1) if m else None
