@@ -97,7 +97,9 @@ class SkeletonExtractor:
         # Step 2: Distance transform for radii
         # ------------------------------------------------------------------
         self.logger.info("Computing distance transform...")
-        sz, sy, sx = voxel_size_um
+        # voxel_size_um from extract_surfaces is (sx, sy, sz) - X first.
+        # distance_transform_edt sampling must match mask axis order (Z, Y, X).
+        sx, sy, sz = voxel_size_um
         dist_um = distance_transform_edt(mask.astype(bool), sampling=(sz, sy, sx))
 
         # ------------------------------------------------------------------
@@ -186,7 +188,7 @@ class SkeletonExtractor:
 
         kd = KDTree(skel_coords)
         G = nx.Graph()
-        sz, sy, sx = voxel_size_um
+        sx, sy, sz = voxel_size_um
         minx, miny, minz = bbox_min_vox
 
         for i, coord in enumerate(skel_coords):
