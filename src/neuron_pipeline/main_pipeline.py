@@ -85,25 +85,38 @@ def run_phase1(
             miplevel=miplevel,
             padding=padding,
         )
+
         if mask is None or voxel_size is None or bbox_min is None:
             logger.error(f"  Voxel extraction failed -- skipping {name}")
             continue
 
         # 1B. Cleaning -- first pass to count components
         cleaned, stats = cleaner.clean_mask(
-            mask, keep_largest_only=False, fill_holes=True, smooth_iterations=0
+                mask,
+                closing_radius=2,
+                keep_largest_only=True,
+                fill_holes=True,
+                smooth_iterations=0,
+                voxel_size_um=voxel_size
         )
+
         if stats['original_components'] > 1:
             logger.warning(
                 f"  {name}: {stats['original_components']} connected components "
                 f"(sizes: kept={stats['kept_components']}, removed={stats['removed_components']})"
             )
+
             # Re-clean keeping only the largest component
             cleaned, stats = cleaner.clean_mask(
-                mask, keep_largest_only=True, fill_holes=True, smooth_iterations=0
+                mask, 
+                closing_radius=2,
+                keep_largest_only=True, 
+                fill_holes=False, 
+                smooth_iterations=0, 
+                voxel_size_um=voxel_size
             )
 
-        # 1C. Skeletonize (includes compression, pruning, soma insertion)
+        # 1C. Skeletonize voxels (includes compression, pruning, soma insertion)
         tree, skel_stats = skel.extract_skeleton(
             mask=cleaned,
             voxel_size_um=voxel_size,

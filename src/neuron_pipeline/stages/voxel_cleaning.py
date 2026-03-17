@@ -7,210 +7,285 @@ This module provides cleaning operations for both voxel masks and surface meshes
 - Fill internal holes
 - Smooth surfaces
 - Remove spurious branches
-
-Author: Nicolas Randazzo
 """
 
 import numpy as np
 from typing import Tuple, Optional, Dict, Any
 from skimage.measure import label
-from scipy.ndimage import binary_fill_holes, binary_erosion, binary_dilation
+from scipy.ndimage import binary_fill_holes, binary_erosion, binary_dilation, binary_closing
 import logging
+
+
+def _make_anisotropic_structuring_element(
+    radius_xy: int,
+    voxel_size_um: Optional[Tuple[float, float, float]] = None,
+) -> np.ndarray:
+    """
+    Build a 3D ellipsoidal structuring element scaled to physical voxel dimensions.
+
+    When voxels are anisotropic (e.g. 5 nm XY vs 50 nm Z), a ball of radius N
+    voxels is physically much larger in Z than in XY.  This element has the same
+    physical radius in all directions, so closing bridges gaps of equal physical
+    size regardless of axis.
+
+    Args:
+        radius_xy  : Closing radius in XY voxels.
+        voxel_size_um : (sx, sy, sz) voxel dimensions in microns.
+                        If None an isotropic ball is returned.
+
+    Returns:
+        Boolean 3D structuring element array (Z, Y, X).
+    """
+    if voxel_size_um is None:
+        from skimage.morphology import ball
+        return ball(radius_xy).astype(bool)
+
+    sx, sy, sz = voxel_size_um
+    # Physical radius = radius_xy * sx  (assumes sx == sy)
+    phys_radius = radius_xy * sx
+
+    # How many voxels does that radius correspond to in each axis?
+    rx = int(np.ceil(phys_radius / sx))
+    ry = int(np.ceil(phys_radius / sy))
+    rz = max(1, int(np.ceil(phys_radius / sz)))
+
+    # Ellipsoid: (x/rx)^2 + (y/ry)^2 + (z/rz)^2 <= 1
+    zz, yy, xx = np.mgrid[-rz:rz + 1, -ry:ry + 1, -rx:rx + 1]
+    element = ((xx / rx) ** 2 + (yy / ry) ** 2 + (zz / rz) ** 2) <= 1.0
+    return element.astype(bool)
 
 
 class VoxelCleaner:
     """
     Clean binary voxel masks for skeletonization.
-    
+
     Removes artifacts that would corrupt skeleton quality:
     - Small disconnected components (specks from annotation errors)
-    - Internal holes (can create false branches)
+    - Internal holes and voids caused by incomplete segmentation fill
     - Surface roughness (optional smoothing)
+
+    Pipeline order
+    --------------
+    1. Morphological closing  — bridges annotation gaps so that interior
+       voids become truly enclosed (not connected to the exterior).
+    2. Component filtering    — discard small specks / keep largest.
+    3. Hole filling           — seal now-enclosed interior voids.
+    4. Smoothing              — optional surface regularisation.
     """
-    
+
     def __init__(self, logger: Optional[logging.Logger] = None):
-        """
-        Initialize the cleaner.
-        
-        Args:
-            logger: Optional logger instance
-        """
         self.logger = logger or logging.getLogger(__name__)
-    
+
     def clean_mask(
         self,
         mask: np.ndarray,
         min_component_voxels: int = 5000,
         keep_largest_only: bool = True,
         fill_holes: bool = True,
-        smooth_iterations: int = 0
+        smooth_iterations: int = 0,
+        closing_radius: int = 2,
+        voxel_size_um: Optional[Tuple[float, float, float]] = None,
     ) -> Tuple[np.ndarray, Dict[str, Any]]:
         """
         Clean a binary voxel mask.
-        
+
         Args:
-            mask: Boolean 3D array (Z, Y, X)
-            min_component_voxels: Minimum size for components to keep (if keep_largest_only=False)
-            keep_largest_only: If True, keep only the largest component (recommended for single neurons)
-            fill_holes: Fill internal holes in the mask
-            smooth_iterations: Number of morphological smoothing iterations (0 = no smoothing)
-            
+            mask                 : Boolean 3D array (Z, Y, X).
+            min_component_voxels : Minimum component size to keep when
+                                   keep_largest_only=False.
+            keep_largest_only    : Keep only the largest connected component.
+            fill_holes           : Fill internal holes / voids after closing.
+            smooth_iterations    : Morphological open/close smoothing passes
+                                   (0 = disabled).
+            closing_radius       : XY-voxel radius for the morphological closing
+                                   step that bridges annotation gaps (0 = skip).
+            voxel_size_um        : (sx, sy, sz) voxel dimensions in microns.
+                                   When supplied, the closing structuring element
+                                   is scaled to be isotropic in physical space,
+                                   which is important for anisotropic datasets
+                                   (e.g. 5 nm XY vs 50 nm Z).
+
         Returns:
             Tuple of (cleaned_mask, stats)
-            - cleaned_mask: Boolean 3D array
-            - stats: Dictionary with cleaning statistics
         """
-        self.logger.info("Starting mask cleaning...")
-        
-        original_voxel_count = np.sum(mask)
-        
+        self.logger.info("[clean_masks] Starting mask cleaning...")
+
+        original_voxel_count = int(np.sum(mask))
+
         stats = {
-            'original_voxel_count': int(original_voxel_count),
+            'original_voxel_count': original_voxel_count,
             'original_components': 0,
             'kept_components': 0,
             'removed_components': 0,
+            'closing_voxels_added': 0,
             'holes_filled': False,
+            'hole_fill_voxels_added': 0,
             'smoothing_iterations': smooth_iterations,
             'final_voxel_count': 0,
             'voxels_added': 0,
-            'voxels_removed': 0
+            'voxels_removed': 0,
         }
-        
-        # Step 1: Component filtering
-        self.logger.info("Identifying connected components...")
-        labeled_mask = label(mask, connectivity=1)  # 6-connectivity
-        num_components = labeled_mask.max()
+
+        # ------------------------------------------------------------------
+        # Step 1: Morphological closing
+        #
+        # Bridges gaps left by incomplete annotation fill so that interior
+        # voids are enclosed (not connected to the exterior) before we call
+        # binary_fill_holes.  Without this step, gaps in the shell connect
+        # interior voids to the background and fill_holes does nothing.
+        #
+        # A physically-isotropic ellipsoidal structuring element is used so
+        # that the closing distance is the same in XY and Z regardless of
+        # voxel anisotropy.
+        # ------------------------------------------------------------------
+        cleaned_mask = mask.astype(bool)
+
+        if closing_radius > 0:
+            self.logger.info(
+                f"[clean_masks] Morphological closing (radius={closing_radius} XY voxels)..."
+            )
+            struct = _make_anisotropic_structuring_element(
+                closing_radius, voxel_size_um
+            )
+            pre_close = int(np.sum(cleaned_mask))
+            cleaned_mask = binary_closing(cleaned_mask, structure=struct)
+            post_close = int(np.sum(cleaned_mask))
+            added = post_close - pre_close
+            stats['closing_voxels_added'] = added
+            self.logger.info(
+                f"[clean_masks]  Closing bridged gaps: +{added:,} voxels "
+                f"(structuring element shape: {struct.shape})"
+            )
+
+        # ------------------------------------------------------------------
+        # Step 2: Component filtering
+        # ------------------------------------------------------------------
+        self.logger.info("[clean_masks] Identifying connected components...")
+        labeled_mask = label(cleaned_mask, connectivity=1)   # 6-connectivity
+        num_components = int(labeled_mask.max())
         stats['original_components'] = num_components
-        
+
         if num_components == 0:
-            self.logger.warning("Input mask is empty")
-            return mask.copy(), stats
-        
+            self.logger.warning("[clean_masks] Input mask is empty after closing")
+            return cleaned_mask, stats
+
         component_sizes = np.bincount(labeled_mask.ravel())
-        component_sizes[0] = 0  # Exclude background
-        
-        self.logger.info(f"Found {num_components} connected components")
-        self.logger.info(f"Component sizes: min={component_sizes[1:].min():,}, "
-                        f"max={component_sizes[1:].max():,}, "
-                        f"median={int(np.median(component_sizes[1:])):,}")
-        
-        # Determine which components to keep
+        component_sizes[0] = 0   # exclude background
+
+        self.logger.info(
+            f"[clean_masks] Found {num_components} connected components — "
+            f"min={component_sizes[1:].min():,}  "
+            f"max={component_sizes[1:].max():,}  "
+            f"median={int(np.median(component_sizes[1:])):,}"
+        )
+
         if keep_largest_only:
-            largest_component_id = component_sizes.argmax()
-            keep_ids = [largest_component_id]
-            self.logger.info(f"Keeping only largest component (ID {largest_component_id}, "
-                           f"{component_sizes[largest_component_id]:,} voxels)")
+            largest_id = int(component_sizes.argmax())
+            keep_ids = [largest_id]
+            self.logger.info(
+                f"[clean_masks] Keeping largest component "
+                f"(ID {largest_id}, {component_sizes[largest_id]:,} voxels)"
+            )
         else:
-            keep_ids = np.where(component_sizes >= min_component_voxels)[0]
-            self.logger.info(f"Keeping {len(keep_ids)} components with >={min_component_voxels:,} voxels")
-        
+            keep_ids = list(np.where(component_sizes >= min_component_voxels)[0])
+            self.logger.info(
+                f"[clean_masks] Keeping {len(keep_ids)} components "
+                f">= {min_component_voxels:,} voxels"
+            )
+
         cleaned_mask = np.isin(labeled_mask, keep_ids)
-        
         stats['kept_components'] = len(keep_ids)
         stats['removed_components'] = num_components - len(keep_ids)
-        
-        # Step 2: Fill holes
+
+        # ------------------------------------------------------------------
+        # Step 3: Fill holes
+        #
+        # Now that closing has sealed gaps in the shell, fill_holes will
+        # correctly identify and fill all enclosed interior voids.
+        # ------------------------------------------------------------------
         if fill_holes:
-            self.logger.info("Filling internal holes...")
-            pre_fill_voxels = np.sum(cleaned_mask)
+            self.logger.info("[clean_masks] Filling internal holes and voids...")
+            pre_fill = int(np.sum(cleaned_mask))
             cleaned_mask = binary_fill_holes(cleaned_mask)
-            post_fill_voxels = np.sum(cleaned_mask)
-            voxels_added = post_fill_voxels - pre_fill_voxels
-            
+            post_fill = int(np.sum(cleaned_mask))
+            added = post_fill - pre_fill
             stats['holes_filled'] = True
-            stats['voxels_added'] = int(voxels_added)
-            
-            if voxels_added > 0:
-                self.logger.info(f"Filled holes: +{int(voxels_added):,} voxels")
-        
-        # Step 3: Morphological smoothing (optional)
+            stats['hole_fill_voxels_added'] = added
+            if added > 0:
+                self.logger.info(f"[clean_masks]  Filled voids: +{added:,} voxels")
+            else:
+                self.logger.info("[clean_masks]  No unfilled voids found (closing handled them)")
+
+        # ------------------------------------------------------------------
+        # Step 4: Morphological smoothing (optional surface regularisation)
+        # ------------------------------------------------------------------
         if smooth_iterations > 0:
-            self.logger.info(f"Applying {smooth_iterations} smoothing iterations...")
-            pre_smooth_voxels = np.sum(cleaned_mask)
-            
-            # Opening operation (erosion + dilation) to smooth surface
-            for i in range(smooth_iterations):
+            self.logger.info(f"[clean_masks] Smoothing ({smooth_iterations} iterations)...")
+            for _ in range(smooth_iterations):
                 cleaned_mask = binary_erosion(cleaned_mask)
                 cleaned_mask = binary_dilation(cleaned_mask)
-            
-            post_smooth_voxels = np.sum(cleaned_mask)
-            voxel_change = post_smooth_voxels - pre_smooth_voxels
-            
-            self.logger.info(f"Smoothing changed voxel count by {voxel_change:+,}")
-        
-        final_voxel_count = np.sum(cleaned_mask)
-        stats['final_voxel_count'] = int(final_voxel_count)
-        stats['voxels_removed'] = int(original_voxel_count - final_voxel_count + stats['voxels_added'])
-        
-        self.logger.info(f"Cleaning complete: {int(original_voxel_count):,} -> {int(final_voxel_count):,} voxels "
-                        f"({100.0 * final_voxel_count / original_voxel_count:.1f}% retained)")
-        
-        return cleaned_mask, stats
-    
+
+        # ------------------------------------------------------------------
+        # Final stats
+        # ------------------------------------------------------------------
+        final_voxel_count = int(np.sum(cleaned_mask))
+        stats['final_voxel_count'] = final_voxel_count
+        stats['voxels_added'] = max(0, final_voxel_count - original_voxel_count)
+        stats['voxels_removed'] = max(0, original_voxel_count - final_voxel_count)
+
+        self.logger.info(
+            f"[clean_masks] Cleaning complete: {original_voxel_count:,} -> {final_voxel_count:,} voxels "
+            f"({100.0 * final_voxel_count / max(original_voxel_count, 1):.1f}% of input)"
+        )
+
+        return cleaned_mask.astype(bool), stats
+
     def get_largest_component(self, mask: np.ndarray) -> np.ndarray:
-        """
-        Quick utility to extract only the largest connected component.
-        
-        Args:
-            mask: Boolean 3D array
-            
-        Returns:
-            Boolean 3D array with only largest component
-        """
+        """Return only the largest connected component."""
         labeled_mask = label(mask, connectivity=1)
         if labeled_mask.max() == 0:
             return mask.copy()
-        
         component_sizes = np.bincount(labeled_mask.ravel())
         component_sizes[0] = 0
-        largest_id = component_sizes.argmax()
-        
-        return labeled_mask == largest_id
+        return (labeled_mask == int(component_sizes.argmax())).astype(bool)
 
 
 class MeshCleaner:
     """
     Clean surface meshes (vertices and faces).
-    
+
     Operations:
     - Remove duplicate vertices
     - Remove degenerate faces
     - Remove isolated vertices
-    - Optionally decimate mesh
     """
-    
+
     def __init__(self, logger: Optional[logging.Logger] = None):
-        """
-        Initialize the cleaner.
-        
-        Args:
-            logger: Optional logger instance
-        """
         self.logger = logger or logging.getLogger(__name__)
-    
+
     def clean_mesh(
         self,
         vertices: np.ndarray,
         faces: np.ndarray,
         remove_duplicates: bool = True,
         remove_degenerate: bool = True,
-        remove_isolated: bool = True
+        remove_isolated: bool = True,
     ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
         """
         Clean a surface mesh.
-        
+
         Args:
-            vertices: (N, 3) array of vertex coordinates
-            faces: (M, 3) array of triangle indices
-            remove_duplicates: Remove duplicate vertices and remap faces
-            remove_degenerate: Remove degenerate triangles (zero area)
-            remove_isolated: Remove vertices not referenced by any face
-            
+            vertices          : (N, 3) vertex coordinates.
+            faces             : (M, 3) triangle indices.
+            remove_duplicates : Merge duplicate vertices and remap faces.
+            remove_degenerate : Remove zero-area triangles.
+            remove_isolated   : Remove vertices unreferenced by any face.
+
         Returns:
-            Tuple of (cleaned_vertices, cleaned_faces, stats)
+            (cleaned_vertices, cleaned_faces, stats)
         """
-        self.logger.info("Starting mesh cleaning...")
-        
+        self.logger.info("[clean_mesh] Starting mesh cleaning...")
+
         stats = {
             'original_vertices': len(vertices),
             'original_faces': len(faces),
@@ -218,115 +293,83 @@ class MeshCleaner:
             'degenerate_faces_removed': 0,
             'isolated_vertices_removed': 0,
             'final_vertices': 0,
-            'final_faces': 0
+            'final_faces': 0,
         }
-        
+
         clean_verts = vertices.copy()
         clean_faces = faces.copy()
-        
-        # Step 1: Remove degenerate faces
+
         if remove_degenerate:
-            self.logger.info("Removing degenerate faces...")
-            # Face is degenerate if any two vertices are the same
-            valid_faces = (
+            self.logger.info("[clean_mesh] Removing degenerate faces...")
+            valid = (
                 (clean_faces[:, 0] != clean_faces[:, 1]) &
                 (clean_faces[:, 1] != clean_faces[:, 2]) &
                 (clean_faces[:, 2] != clean_faces[:, 0])
             )
-            
-            degenerate_count = len(clean_faces) - np.sum(valid_faces)
-            clean_faces = clean_faces[valid_faces]
-            stats['degenerate_faces_removed'] = int(degenerate_count)
-            
-            if degenerate_count > 0:
-                self.logger.info(f"Removed {degenerate_count} degenerate faces")
-        
-        # Step 2: Remove duplicate vertices
+            n_removed = int(len(clean_faces) - np.sum(valid))
+            clean_faces = clean_faces[valid]
+            stats['degenerate_faces_removed'] = n_removed
+            if n_removed:
+                self.logger.info(f"  Removed {n_removed} degenerate faces")
+
         if remove_duplicates:
-            self.logger.info("Removing duplicate vertices...")
-            # Find unique vertices and create remapping
-            unique_verts, inverse_indices = np.unique(
-                clean_verts, axis=0, return_inverse=True
-            )
-            
-            duplicate_count = len(clean_verts) - len(unique_verts)
-            
-            if duplicate_count > 0:
-                # Remap face indices
-                clean_faces = inverse_indices[clean_faces]
+            self.logger.info("[clean_mesh] Removing duplicate vertices...")
+            unique_verts, inv = np.unique(clean_verts, axis=0, return_inverse=True)
+            n_removed = int(len(clean_verts) - len(unique_verts))
+            if n_removed:
+                clean_faces = inv[clean_faces]
                 clean_verts = unique_verts
-                stats['duplicate_vertices_removed'] = int(duplicate_count)
-                self.logger.info(f"Removed {duplicate_count} duplicate vertices")
-        
-        # Step 3: Remove isolated vertices
+                stats['duplicate_vertices_removed'] = n_removed
+                self.logger.info(f"  Removed {n_removed} duplicate vertices")
+
         if remove_isolated:
-            self.logger.info("Removing isolated vertices...")
-            # Find which vertices are actually used
-            used_vertices = np.unique(clean_faces.ravel())
-            
-            isolated_count = len(clean_verts) - len(used_vertices)
-            
-            if isolated_count > 0:
-                # Create mapping from old to new indices
-                new_indices = np.full(len(clean_verts), -1, dtype=np.int64)
-                new_indices[used_vertices] = np.arange(len(used_vertices))
-                
-                # Remap faces and extract used vertices
-                clean_faces = new_indices[clean_faces]
-                clean_verts = clean_verts[used_vertices]
-                
-                stats['isolated_vertices_removed'] = int(isolated_count)
-                self.logger.info(f"Removed {isolated_count} isolated vertices")
-        
+            self.logger.info("[clean_mesh] Removing isolated vertices...")
+            used = np.unique(clean_faces.ravel())
+            n_removed = int(len(clean_verts) - len(used))
+            if n_removed:
+                remap = np.full(len(clean_verts), -1, dtype=np.int64)
+                remap[used] = np.arange(len(used))
+                clean_faces = remap[clean_faces]
+                clean_verts = clean_verts[used]
+                stats['isolated_vertices_removed'] = n_removed
+                self.logger.info(f"[clean_mesh]   Removed {n_removed} isolated vertices")
+
         stats['final_vertices'] = len(clean_verts)
         stats['final_faces'] = len(clean_faces)
-        
-        self.logger.info(f"Mesh cleaning complete:")
-        self.logger.info(f"  Vertices: {stats['original_vertices']:,} -> {stats['final_vertices']:,}")
-        self.logger.info(f"  Faces: {stats['original_faces']:,} -> {stats['final_faces']:,}")
-        
+
+        self.logger.info(
+            f"[clean_mesh] Mesh cleaning complete: "
+            f"verts {stats['original_vertices']:,} -> {stats['final_vertices']:,}  "
+            f"faces {stats['original_faces']:,} -> {stats['final_faces']:,}"
+        )
+
         return clean_verts, clean_faces, stats
 
 
 def quick_clean_mask(
     mask: np.ndarray,
     keep_largest: bool = True,
-    fill_holes: bool = True
+    fill_holes: bool = True,
+    closing_radius: int = 2,
+    voxel_size_um: Optional[Tuple[float, float, float]] = None,
 ) -> np.ndarray:
-    """
-    Quick convenience function for basic mask cleaning.
-    
-    Args:
-        mask: Boolean 3D array
-        keep_largest: Keep only largest component
-        fill_holes: Fill internal holes
-        
-    Returns:
-        Cleaned boolean mask
-    """
+    """One-call mask cleaning with gap-bridging closing."""
     cleaner = VoxelCleaner()
     cleaned, _ = cleaner.clean_mask(
         mask,
         keep_largest_only=keep_largest,
-        fill_holes=fill_holes
+        fill_holes=fill_holes,
+        closing_radius=closing_radius,
+        voxel_size_um=voxel_size_um,
     )
     return cleaned
 
 
 def quick_clean_mesh(
     vertices: np.ndarray,
-    faces: np.ndarray
+    faces: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Quick convenience function for basic mesh cleaning.
-    
-    Args:
-        vertices: (N, 3) vertex array
-        faces: (M, 3) face array
-        
-    Returns:
-        Tuple of (cleaned_vertices, cleaned_faces)
-    """
+    """One-call mesh cleaning."""
     cleaner = MeshCleaner()
     clean_verts, clean_faces, _ = cleaner.clean_mesh(vertices, faces)
     return clean_verts, clean_faces

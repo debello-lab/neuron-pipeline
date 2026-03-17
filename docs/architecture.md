@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes the architecture of **ms-neuron-pipeline**, a Python project that (1) provides an open-source interface for exporting data from **VAST Lite** without MATLAB, and (2) runs a multi-stage pipeline to produce downstream morphology artifacts such as voxel masks, skeletons, SWC files, and marker/centroid tables.
+This document describes the architecture of **ms-neuron-pipeline**, a Python project that (1) provides an open-source interface for exporting data from **VAST Lite** without MATLAB, and (2) runs a multi-stage pipeline to produce downstream morphology artifacts that can be used in neuron digital simulation software.
 
 The project is intentionally split into two layers:
 
@@ -59,13 +59,11 @@ ms-neuron-pipeline/
 
 ## Data flow overview
 
-At a high level, the pipeline proceeds in phases:
-
 1. **Phase 0 -- Classification**
     - Identify and register segments of interest by type (e.g., AXON, POST_SYN, BOUTON, SYNAPSE/CONTACT).
     - Output: a `SegmentRegistry` that becomes the shared “truth” for subsequent phases.
 
-2. **Phase 1 -- Skeletonization + SWC**
+2. **Phase 1 -- Extraction, Skeletonization + SWC**
     - Export segment voxel masks or surfaces from VAST Lite.
     - Clean voxel representations to remove small components / artifacts.
     - Skeletonize the cleaned representation and convert it into an SWC tree.
@@ -209,8 +207,8 @@ Defines the high-level control flow:
 - instantiate classifier and build registry
 - run phase 1 and write SWCs
 - run phase 2 and write centroids
-- (planned) run phase 3 mapping
-- (planned) run phase 4 Arbor instrumentation
+- run phase 3 mapping
+- run phase 4 Arbor instrumentation
 
 ### `scripts/run_pipeline.py`
 Runs the `main_pipeline` (i.e., a wrapper). This is the recommended entrypoint for running the pipeline from the repo root.
