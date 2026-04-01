@@ -34,11 +34,11 @@ def main() -> None:
     # 2. Extract voxel mask
     log.info(f"Extracting voxel mask for segment {SEGMENT_ID} (MIP {MIPLEVEL})...")
     extractor = SegmentSurfaceExtractor(vast, str(OUTPUT_DIR))
-    mask, bbox_min, voxel_size, _ = extractor.extract_segment(
-        segment_id=SEGMENT_ID,
-        miplevel=MIPLEVEL,
-        padding=PADDING,
-    )
+    mask, bbox_min, voxel_size, _ = extractor.extract_segment_voxel(
+            segment_id=SEGMENT_ID,
+            miplevel=MIPLEVEL,
+            padding=PADDING,
+        )
 
     if mask is None or voxel_size is None or bbox_min is None:
         log.error("Voxel extraction failed. Is the segment ID valid?")

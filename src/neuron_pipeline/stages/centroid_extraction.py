@@ -46,6 +46,10 @@ class CentroidEntry:
     cy_um: float
     cz_um: float
     method: str                      # voxel | bbox_fallback | anchor
+    # Coordinate frame tag -- must match the skeleton tree's coord_frame
+    # attribute set in Phase 1 (graph_to_tree). Phase 3 asserts equality
+    # before building the KDTree to catch silent space mismatches.
+    coord_frame: str = 'physical_um_xyz'
 
 
 @dataclass
@@ -71,7 +75,7 @@ class CentroidTable:
     def write_csv(self, path: str) -> str:
         """Write centroids to a CSV file. Returns the path written."""
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        fieldnames = ['name', 'seg_id', 'role', 'cx_um', 'cy_um', 'cz_um', 'method']
+        fieldnames = ['name', 'seg_id', 'role', 'cx_um', 'cy_um', 'cz_um', 'method', 'coord_frame']
         with open(path, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
@@ -238,22 +242,25 @@ class CentroidExtractor:
         if bbox_min_vox is None or voxel_size_um is None:
             return None
 
-        # mask is (Z, Y, X); bbox_min_vox is (minx, miny, minz)
-        # voxel_size_um is (sx, sy, sz)
+        # mask is (Z, Y, X) following numpy convention; np.where returns in that order.
         z_idx, y_idx, x_idx = np.where(mask)
 
-        
-        cx_vox = x_idx.mean() + bbox_min_vox[0]
-        cy_vox = y_idx.mean() + bbox_min_vox[1]
-        cz_vox = z_idx.mean() + bbox_min_vox[2]
+        # Step 1 — local centroid in voxel space (relative to the extracted sub-volume)
+        local_cx_vox = x_idx.mean()
+        local_cy_vox = y_idx.mean()
+        local_cz_vox = z_idx.mean()
 
-        # cx_vox = (x_idx + 0.5).mean() + bbox_min_vox[0]
-        # cy_vox = (y_idx + 0.5).mean() + bbox_min_vox[1]
-        # cz_vox = (z_idx + 0.5).mean() + bbox_min_vox[2]
+        # Step 2 — global voxel space (add bbox origin: bbox_min_vox = (minx, miny, minz))
+        global_cx_vox = local_cx_vox + bbox_min_vox[0]
+        global_cy_vox = local_cy_vox + bbox_min_vox[1]
+        global_cz_vox = local_cz_vox + bbox_min_vox[2]
 
-        cx_um = float(cx_vox * voxel_size_um[0])
-        cy_um = float(cy_vox * voxel_size_um[1])
-        cz_um = float(cz_vox * voxel_size_um[2])
+        # Step 3 — physical µm (voxel_size_um = (sx, sy, sz); corner-of-voxel convention)
+        # For centre-of-voxel, add 0.5 to each local index before step 2:
+        #   global_cx_vox = (local_cx_vox + 0.5) + bbox_min_vox[0]  etc.
+        cx_um = float(global_cx_vox * voxel_size_um[0])
+        cy_um = float(global_cy_vox * voxel_size_um[1])
+        cz_um = float(global_cz_vox * voxel_size_um[2])
 
         return CentroidEntry(
             name=info.name,

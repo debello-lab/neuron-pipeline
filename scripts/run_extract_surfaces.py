@@ -38,7 +38,7 @@ def main():
         
         else: # Surface extraction to .obj files
             # Create extractor
-            extractor = SegmentSurfaceExtractor(vast, output_dir="../vast_export")
+            extractor = SegmentSurfaceExtractor(vast, output_dir="./vast_export")
             
             num_segments = vast.get_number_of_segments()
             if num_segments is None:
@@ -52,7 +52,7 @@ def main():
                 vertices, faces, output_path = extractor.extract_segment(
                     segment_id=segment_id,
                     miplevel=1,  # half resolution
-                    close_surfaces=False,
+                    close_surfaces=True,
                     output_format='obj'
                 )
                 

@@ -115,7 +115,7 @@ def run_stage_tests(
     log.info(f"[{prefix}] Stage 01 — closing")
     m01, stats = cleaner.clean_mask(
         mask,
-        closing_radius=2,
+        closing_radius_um=2,
         keep_largest_only=False,
         fill_holes=False,
         smooth_iterations=0,
@@ -131,7 +131,7 @@ def run_stage_tests(
     log.info(f"[{prefix}] Stage 02 — closing + component filter")
     m02, stats = cleaner.clean_mask(
         mask,
-        closing_radius=2,
+        closing_radius_um=2,
         keep_largest_only=True,
         fill_holes=False,
         smooth_iterations=0,
@@ -147,7 +147,7 @@ def run_stage_tests(
     log.info(f"[{prefix}] Stage 03 — closing + component filter + hole fill")
     m03, stats = cleaner.clean_mask(
         mask,
-        closing_radius=2,
+        closing_radius_um=2,
         keep_largest_only=True,
         fill_holes=True,
         smooth_iterations=0,

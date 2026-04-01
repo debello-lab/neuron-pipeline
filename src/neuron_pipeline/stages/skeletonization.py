@@ -75,6 +75,7 @@ class SkeletonExtractor:
             'compressed_edges': 0,
             'branches_pruned': 0,
             'total_length_um': 0.0,
+            'coord_frame': 'physical_um_xyz',
         }
 
         if not np.any(mask):
@@ -192,8 +193,16 @@ class SkeletonExtractor:
         minx, miny, minz = bbox_min_vox
 
         for i, coord in enumerate(skel_coords):
-            z, y, x = coord
-            G.add_node(i, pos=((x + minx) * sx, (y + miny) * sy, (z + minz) * sz), voxel_pos=coord)
+            z, y, x = coord   # local voxel indices from np.argwhere — ZYX order
+            # Step 1: local → global voxel (add bbox origin; bbox_min_vox = (minx, miny, minz))
+            global_x_vox = x + minx
+            global_y_vox = y + miny
+            global_z_vox = z + minz
+            # Step 2: global voxel → physical µm (voxel_size_um = (sx, sy, sz), X first)
+            pos_x_um = global_x_vox * sx
+            pos_y_um = global_y_vox * sy
+            pos_z_um = global_z_vox * sz
+            G.add_node(i, pos=(pos_x_um, pos_y_um, pos_z_um), voxel_pos=coord)
 
         for i, coord in enumerate(skel_coords):
             for j in kd.query_ball_point(coord, r=1.8):   # sqrt(3) + margin = 26-conn
@@ -476,6 +485,24 @@ class SkeletonExtractor:
                 root_node = max(G.nodes(), key=lambda n: G.nodes[n].get('degree', G.degree(n)))
                 self.logger.info(f"Root: node {root_node} (highest degree, no endpoints)")
 
+        # Check for disconnected components before BFS. If the skeleton graph
+        # is disconnected (e.g. from narrow necks surviving pruning), BFS from
+        # root_node would silently leave other components as parentless nodes.
+        # Instead, restrict the tree to the root's component only and log what
+        # was dropped so the caller can decide how to handle it.
+        n_components = nx.number_connected_components(G)
+        if n_components > 1:
+            root_component = nx.node_connected_component(G, root_node)
+            dropped_nodes = G.number_of_nodes() - len(root_component)
+            dropped_components = n_components - 1
+            self.logger.warning(
+                f"graph_to_tree: skeleton graph has {n_components} connected components. "
+                f"Keeping root component ({len(root_component)} nodes). "
+                f"Dropping {dropped_components} component(s) ({dropped_nodes} nodes). "
+                f"Consider inspecting skeletonization output for narrow necks or artifacts."
+            )
+            G = G.subgraph(root_component)
+
         tree = nx.DiGraph()
         for n in G.nodes():
             tree.add_node(n, **G.nodes[n])
@@ -489,6 +516,11 @@ class SkeletonExtractor:
                     visited.add(nb)
                     queue.append(nb)
                     tree.add_edge(parent, nb, **G.get_edge_data(parent, nb))
+
+        # Tag the graph with its coordinate frame so Phase 3 can assert
+        # that skeleton and centroid coordinates are in the same space.
+        # Convention: physical micrometres, axis order (X, Y, Z).
+        tree.graph['coord_frame'] = 'physical_um_xyz'
 
         self.logger.info(
             f"Tree: {tree.number_of_nodes()} nodes, {tree.number_of_edges()} edges"
@@ -524,6 +556,15 @@ class SkeletonExtractor:
         roots = [n for n in tree.nodes() if tree.in_degree(n) == 0]
         if not roots:
             return tree
+        if len(roots) > 1:
+            # Multiple roots indicate graph_to_tree produced a disconnected
+            # DiGraph — this should not happen after the component check there,
+            # but guard here in case the tree was constructed by other means.
+            self.logger.warning(
+                f"insert_synthetic_soma: tree has {len(roots)} root nodes (in_degree==0). "
+                f"Expected exactly 1. Only the first root will receive a soma stub; "
+                f"other components will be left unrooted in the SWC output."
+            )
         root = roots[0]
 
         root_pos = np.array(tree.nodes[root]['pos'])
@@ -660,6 +701,9 @@ class SWCWriter:
                 f"{radius:.6f} {parent_swc_id}\n"
             )
             node_swc_id = swc_id
+            # Stamp the SWC row ID back onto the node so Phase 3 can resolve
+            # graph node IDs → SWC row numbers without a second traversal.
+            tree.nodes[node]['swc_id'] = node_swc_id
             swc_id += 1
 
             for child in tree.successors(node):

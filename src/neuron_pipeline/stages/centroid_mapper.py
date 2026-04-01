@@ -68,6 +68,15 @@ class CableMappingEntry:
     nearest_z_um: float
     distance_um: float          # Euclidean distance centroid -> cable
 
+    # Coordinate frame and QC
+    coord_frame: str = 'physical_um_xyz'
+    # Distance QC tier: 'ok' (<ok_distance_um), 'warn', 'suspicious' (>=warn_distance_um)
+    qc_distance_flag: str = 'ok'
+    # SWC row IDs stamped by SWCWriter onto the tree nodes in Phase 1.
+    # None when write_swc() was not called before Phase 3 (e.g. unit tests).
+    swc_node_u: Optional[int] = None
+    swc_node_v: Optional[int] = None
+
 
 @dataclass
 class CableMappingTable:
@@ -94,6 +103,7 @@ class CableMappingTable:
             'edge_u', 'edge_v', 'arc_fraction',
             'nearest_x_um', 'nearest_y_um', 'nearest_z_um',
             'distance_um',
+            'coord_frame', 'qc_distance_flag', 'swc_node_u', 'swc_node_v',
         ]
         with open(path, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -230,6 +240,7 @@ class CentroidMapper:
         centroid_table: CentroidTable,
         trees: Dict[str, Tuple[nx.DiGraph, str]],
         registry: SegmentRegistry,
+        ok_distance_um: float = 2.0,
         warn_distance_um: float = 5.0,
         extra_entries: Optional[List] = None,
     ) -> CableMappingTable:
@@ -247,12 +258,22 @@ class CentroidMapper:
         Returns:
             CableMappingTable with one entry per centroid.
         """
+        # --- Coordinate frame validation ---
+        # Both Phase 1 (skeleton trees) and Phase 2 (centroids) tag their
+        # outputs with a coord_frame string. Assert they match before any
+        # spatial work is done. A mismatch here (e.g. voxel vs physical space)
+        # would corrupt all arc-fraction and distance outputs silently.
+        self._assert_frame_consistency(centroid_table, trees)
+
         # Pre-build spatial indices -- one per skeleton tree
         self.logger.info(f"Building spatial indices for {len(trees)} skeleton trees...")
         indices: Dict[str, _TreeIndex] = {
             name: _TreeIndex(tree)
             for name, (tree, _) in trees.items()
         }
+
+        # Log skeleton bounding boxes once so mismatches are visible in logs.
+        self._log_skeleton_bounds(trees)
 
         post_syn_entries = []
         for name, info in registry.segments.items():
@@ -286,7 +307,7 @@ class CentroidMapper:
 
         for entry in all_entries:
             result = self._map_one(
-                entry, indices, registry, warn_distance_um
+                entry, indices, registry, ok_distance_um, warn_distance_um
             )
             if result == 'no_cell':
                 n_no_cell += 1
@@ -301,6 +322,16 @@ class CentroidMapper:
             f"{n_no_tree} skipped (no skeleton), "
             f"{n_no_cell} skipped (no parent cell in registry)"
         )
+
+        # QC summary: count per distance tier across all mapped entries
+        qc_counts: Dict[str, int] = {'ok': 0, 'warn': 0, 'suspicious': 0}
+        for e in mapping_table.entries:
+            qc_counts[e.qc_distance_flag] = qc_counts.get(e.qc_distance_flag, 0) + 1
+        self.logger.info(
+            f"Phase 3 QC distance: ok={qc_counts['ok']}, "
+            f"warn={qc_counts['warn']}, suspicious={qc_counts['suspicious']}"
+        )
+
         return mapping_table
 
     # ------------------------------------------------------------------
@@ -312,6 +343,7 @@ class CentroidMapper:
         entry: CentroidEntry,
         indices: Dict[str, _TreeIndex],
         registry: SegmentRegistry,
+        ok_distance_um: float,
         warn_distance_um: float,
     ):
         """
@@ -332,6 +364,8 @@ class CentroidMapper:
             )
             return 'no_tree'
 
+        # Both centroid and skeleton are in physical_um_xyz — validated by
+        # _assert_frame_consistency() before this method is called.
         point = np.array([entry.cx_um, entry.cy_um, entry.cz_um], dtype=np.float64)
         result = idx.query(point)
         if result is None:
@@ -339,11 +373,27 @@ class CentroidMapper:
 
         u, v, arc_frac, nearest_pos, dist = result
 
-        if dist > warn_distance_um:
+        # Three-tier distance QC
+        if dist < ok_distance_um:
+            qc_flag = 'ok'
+        elif dist < warn_distance_um:
+            qc_flag = 'warn'
             self.logger.warning(
-                f"  {entry.name}: nearest cable point is {dist:.2f} µm away "
-                f"(>{warn_distance_um} µm -- check annotation or skeleton)"
+                f"  {entry.name}: {dist:.2f} µm from cable "
+                f"(>ok threshold {ok_distance_um} µm)"
             )
+        else:
+            qc_flag = 'suspicious'
+            self.logger.warning(
+                f"  {entry.name}: {dist:.2f} µm from cable -- SUSPICIOUS "
+                f"(>{warn_distance_um} µm, check annotation or skeleton)"
+            )
+
+        # Look up SWC row IDs stamped by SWCWriter in Phase 1.
+        # _TreeIndex stores a reference to the tree; swc_id is None when
+        # write_swc() was not called before Phase 3 (e.g. in unit tests).
+        swc_node_u = idx._tree.nodes[u].get('swc_id')
+        swc_node_v = idx._tree.nodes[v].get('swc_id')
 
         return CableMappingEntry(
             centroid_name=entry.name,
@@ -360,6 +410,9 @@ class CentroidMapper:
             nearest_y_um=float(nearest_pos[1]),
             nearest_z_um=float(nearest_pos[2]),
             distance_um=dist,
+            qc_distance_flag=qc_flag,
+            swc_node_u=swc_node_u,
+            swc_node_v=swc_node_v,
         )
 
     # ------------------------------------------------------------------
@@ -420,3 +473,81 @@ class CentroidMapper:
         import re
         m = re.match(r'^(A\d+)', name)
         return m.group(1) if m else None
+
+    # ------------------------------------------------------------------
+    # Coordinate frame validation
+    # ------------------------------------------------------------------
+
+    def _assert_frame_consistency(
+        self,
+        centroid_table: 'CentroidTable',
+        trees: Dict[str, Tuple[nx.DiGraph, str]],
+    ) -> None:
+        """
+        Assert that all skeleton trees and all centroids share the same
+        coordinate frame tag. Raises ValueError on any mismatch so the
+        pipeline fails loudly rather than producing silently wrong output.
+
+        The coord_frame tag is set by:
+          - Phase 1 (graph_to_tree): tree.graph['coord_frame']
+          - Phase 2 (CentroidEntry): entry.coord_frame  (default 'physical_um_xyz')
+        """
+        expected = 'physical_um_xyz'
+
+        for cell_name, (tree, _) in trees.items():
+            frame = tree.graph.get('coord_frame')
+            if frame is None:
+                self.logger.warning(
+                    f"Skeleton '{cell_name}' has no coord_frame attribute -- "
+                    f"was it produced by an older version of graph_to_tree? "
+                    f"Assuming '{expected}'."
+                )
+            elif frame != expected:
+                raise ValueError(
+                    f"Skeleton '{cell_name}' coord_frame='{frame}' does not match "
+                    f"expected '{expected}'. Coordinate space mismatch would corrupt "
+                    f"all synapse placement output."
+                )
+
+        for entry in centroid_table.entries:
+            frame = getattr(entry, 'coord_frame', None)
+            if frame is None:
+                self.logger.warning(
+                    f"Centroid '{entry.name}' has no coord_frame -- assuming '{expected}'."
+                )
+            elif frame != expected:
+                raise ValueError(
+                    f"Centroid '{entry.name}' coord_frame='{frame}' does not match "
+                    f"expected '{expected}'. Coordinate space mismatch would corrupt "
+                    f"all synapse placement output."
+                )
+
+    def _log_skeleton_bounds(
+        self,
+        trees: Dict[str, Tuple[nx.DiGraph, str]],
+    ) -> None:
+        """
+        Log the physical bounding box of each skeleton tree in µm.
+
+        This gives a visible record of the spatial extent of each cell's
+        skeleton, which makes it easy to spot-check whether centroids (logged
+        separately via warn_distance_um) fall in a plausible region.
+        """
+        for cell_name, (tree, _) in trees.items():
+            positions = [
+                tree.nodes[n]['pos']
+                for n in tree.nodes()
+                if 'pos' in tree.nodes[n]
+            ]
+            if not positions:
+                self.logger.info(f"  Skeleton '{cell_name}': no node positions found")
+                continue
+            pts = np.array(positions, dtype=np.float64)
+            lo = pts.min(axis=0)
+            hi = pts.max(axis=0)
+            self.logger.info(
+                f"  Skeleton '{cell_name}' bounds (µm): "
+                f"X [{lo[0]:.1f}, {hi[0]:.1f}]  "
+                f"Y [{lo[1]:.1f}, {hi[1]:.1f}]  "
+                f"Z [{lo[2]:.1f}, {hi[2]:.1f}]"
+            )

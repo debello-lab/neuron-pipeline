@@ -46,6 +46,7 @@ def run_phase1(
 ) -> Dict[str, Tuple[nx.DiGraph, str]]:
     """
     Phase 1: Extract and skeletonize every AXON and POST_SYN segment.
+    After extraction but before skeletonization, the segments will be cleaned to remove small disconnected components and fill holes. The resulting skeletons are pruned to remove short spurs, and the final SWC files are written to disk.
 
     Args:
         registry: SegmentRegistry from Phase 0
@@ -137,6 +138,9 @@ def run_phase1(
                 'segment_name': name,
                 'role': info.role,
                 'miplevel': miplevel,
+                'bbox_min_vox': str(bbox_min),      # (minx, miny, minz) in voxels
+                'voxel_size_um': str(voxel_size),   # (sx, sy, sz) in µm
+                'coord_frame': 'physical_um_xyz',
                 'compressed_nodes': skel_stats.get('compressed_nodes'),
                 'spurs_pruned': skel_stats.get('branches_pruned'),
                 'total_length_um': f"{skel_stats.get('total_length_um', 0):.2f}",
@@ -211,6 +215,7 @@ def run_phase3(
     trees: Dict[str, Tuple[nx.DiGraph, str]],
     registry: SegmentRegistry,
     output_dir: str = "./vast_export",
+    ok_distance_um: float = 2.0,
     warn_distance_um: float = 5.0,
 ) -> CableMappingTable:
     """
@@ -236,6 +241,7 @@ def run_phase3(
         centroid_table=centroid_table,
         trees=trees,
         registry=registry,
+        ok_distance_um=ok_distance_um,
         warn_distance_um=warn_distance_um,
     )
 

@@ -54,6 +54,99 @@ def _make_anisotropic_structuring_element(
     element = ((xx / rx) ** 2 + (yy / ry) ** 2 + (zz / rz) ** 2) <= 1.0
     return element.astype(bool)
 
+from dataclasses import dataclass
+from typing import Tuple, Literal
+import numpy as np
+
+# Explicit coordinate frame types
+CoordFrame = Literal[
+    'vast_global_voxel_xyz',      # VAST dataset space, corner-of-voxel, (x,y,z) ordering
+    'local_bbox_voxel_xyz',       # Bounding-box-relative, corner-of-voxel, (x,y,z)
+    'numpy_array_index_zyx',      # NumPy array indices, (z,y,x) ordering
+    'physical_um_xyz',            # Physical micrometers, center-of-voxel, (x,y,z)
+]
+
+@dataclass
+class VoxelData:
+    """Voxel mask with validated spatial metadata."""
+    
+    # The mask itself (NumPy array index space)
+    mask: np.ndarray  # shape (Z, Y, X), dtype bool
+    
+    # Spatial reference (how to convert mask indices to physical space)
+    bbox_min_vox: Tuple[int, int, int]        # (minx, miny, minz) in VAST global voxel space
+    voxel_size_um: Tuple[float, float, float] # (sx, sy, sz) — voxel dimensions in µm
+    
+    # Explicit coordinate frame labels
+    mask_index_frame: CoordFrame = 'numpy_array_index_zyx'
+    bbox_frame: CoordFrame = 'vast_global_voxel_xyz'
+    
+    # Quality metrics
+    total_voxels: int = 0
+    bbox_volume_voxels: int = 0
+    fill_fraction: float = 0.0  # total_voxels / bbox_volume
+    
+    def __post_init__(self):
+        """Validate internal consistency."""
+        # Shape checks
+        assert self.mask.ndim == 3, f"Mask must be 3D, got shape {self.mask.shape}"
+        assert self.mask.dtype == bool, f"Mask must be boolean, got {self.mask.dtype}"
+        
+        # Coordinate tuple lengths
+        assert len(self.bbox_min_vox) == 3, "bbox_min_vox must be (x, y, z)"
+        assert len(self.voxel_size_um) == 3, "voxel_size_um must be (sx, sy, sz)"
+        
+        # Positivity checks
+        assert all(s > 0 for s in self.voxel_size_um), \
+            f"Voxel sizes must be positive, got {self.voxel_size_um}"
+        
+        # Compute quality metrics
+        self.total_voxels = int(np.sum(self.mask))
+        Z, Y, X = self.mask.shape
+        self.bbox_volume_voxels = X * Y * Z
+        self.fill_fraction = self.total_voxels / self.bbox_volume_voxels if self.bbox_volume_voxels > 0 else 0.0
+        
+        # Sanity checks for degenerate cases
+        if self.total_voxels == 0:
+            raise ValueError("Extracted mask is completely empty")
+        
+        if self.fill_fraction < 0.001:  # Less than 0.1% filled
+            raise ValueError(
+                f"Mask is suspiciously sparse: {self.total_voxels}/{self.bbox_volume_voxels} voxels "
+                f"({self.fill_fraction*100:.3f}% filled). This likely indicates an extraction error."
+            )
+    
+    def to_physical_um(self, z_idx: int, y_idx: int, x_idx: int, 
+                      use_voxel_centers: bool = True) -> Tuple[float, float, float]:
+        """
+        Convert NumPy array indices to physical micrometers.
+        
+        Args:
+            z_idx, y_idx, x_idx: Indices in the mask array (ZYX ordering)
+            use_voxel_centers: If True, add 0.5 to place point at voxel center
+                              If False, use corner-of-voxel convention
+        
+        Returns:
+            (x_um, y_um, z_um) in physical space
+        """
+        # Step 1: Array index → local voxel coordinate
+        # (add 0.5 for center-of-voxel convention)
+        offset = 0.5 if use_voxel_centers else 0.0
+        local_x = x_idx + offset
+        local_y = y_idx + offset
+        local_z = z_idx + offset
+        
+        # Step 2: Local voxel → global voxel (add bbox origin)
+        global_x_vox = local_x + self.bbox_min_vox[0]
+        global_y_vox = local_y + self.bbox_min_vox[1]
+        global_z_vox = local_z + self.bbox_min_vox[2]
+        
+        # Step 3: Global voxel → physical µm (scale by voxel size)
+        x_um = global_x_vox * self.voxel_size_um[0]
+        y_um = global_y_vox * self.voxel_size_um[1]
+        z_um = global_z_vox * self.voxel_size_um[2]
+        
+        return (x_um, y_um, z_um)
 
 class VoxelCleaner:
     """
@@ -83,9 +176,9 @@ class VoxelCleaner:
         keep_largest_only: bool = True,
         fill_holes: bool = True,
         smooth_iterations: int = 0,
-        closing_radius: int = 2,
+        closing_radius_um: float = 1.0,
         voxel_size_um: Optional[Tuple[float, float, float]] = None,
-    ) -> Tuple[np.ndarray, Dict[str, Any]]:
+    ) -> Tuple[VoxelData, Dict[str, Any]]:
         """
         Clean a binary voxel mask.
 
@@ -127,6 +220,12 @@ class VoxelCleaner:
         }
 
         # ------------------------------------------------------------------
+        # Step 0
+        # ------------------------------------------------------------------
+        if opening_radius > 0:
+            struct_open = _make_anisotropic_structuring_element(opening_radius, voxel_size_um)
+            cleaned_mask = binary_opening(cleaned_mask, structure=struct_open)
+        # ------------------------------------------------------------------
         # Step 1: Morphological closing
         #
         # Bridges gaps left by incomplete annotation fill so that interior
@@ -140,12 +239,12 @@ class VoxelCleaner:
         # ------------------------------------------------------------------
         cleaned_mask = mask.astype(bool)
 
-        if closing_radius > 0:
+        if closing_radius_um > 0:
             self.logger.info(
-                f"[clean_masks] Morphological closing (radius={closing_radius} XY voxels)..."
+                f"[clean_masks] Morphological closing (radius={closing_radius_um} XY voxels)..."
             )
             struct = _make_anisotropic_structuring_element(
-                closing_radius, voxel_size_um
+                closing_radius_um, voxel_size_um
             )
             pre_close = int(np.sum(cleaned_mask))
             cleaned_mask = binary_closing(cleaned_mask, structure=struct)
@@ -156,6 +255,13 @@ class VoxelCleaner:
                 f"[clean_masks]  Closing bridged gaps: +{added:,} voxels "
                 f"(structuring element shape: {struct.shape})"
             )
+        
+        if voxel_size_um:
+            sx, sy, sz = voxel_size_um
+            avg_voxel_um = (sx + sy) / 2.0  # Use XY average since closing_radius is described as "XY voxels"
+            closing_radius_vox = max(1, int(np.round(closing_radius_um / avg_voxel_um)))
+        else:
+            closing_radius_vox = closing_radius_um  # Fallback to voxel units if no calibration
 
         # ------------------------------------------------------------------
         # Step 2: Component filtering
@@ -238,7 +344,11 @@ class VoxelCleaner:
             f"({100.0 * final_voxel_count / max(original_voxel_count, 1):.1f}% of input)"
         )
 
-        return cleaned_mask.astype(bool), stats
+        return VoxelData(
+            mask=cleaned_mask,
+            bbox_min_vox=voxel_data.bbox_min_vox,  # Preserved
+            voxel_size_um=voxel_data.voxel_size_um,  # Preserved
+        ), stats
 
     def get_largest_component(self, mask: np.ndarray) -> np.ndarray:
         """Return only the largest connected component."""

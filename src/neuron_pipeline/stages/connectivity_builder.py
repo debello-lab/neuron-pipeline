@@ -75,6 +75,14 @@ class SynapseRow:
     bouton_name: str
     bouton_seg_id: int
 
+    # QC and SWC row IDs (from Phase 3 CableMappingEntry)
+    pre_qc_flag:  str           = 'ok'
+    pre_swc_u:    Optional[int] = None   # SWC row ID of pre_edge_u node
+    pre_swc_v:    Optional[int] = None   # SWC row ID of pre_edge_v node
+    post_qc_flag: str           = 'ok'
+    post_swc_u:   Optional[int] = None   # SWC row ID of post_edge_u node
+    post_swc_v:   Optional[int] = None   # SWC row ID of post_edge_v node
+
 
 @dataclass
 class ConnectivityOutput:
@@ -295,6 +303,12 @@ class ConnectivityBuilder:
             synapse_seg_id=conn_row.synapse_seg_id,
             bouton_name=conn_row.bouton_name,
             bouton_seg_id=conn_row.bouton_seg_id,
+            pre_qc_flag=getattr(bouton_map,   'qc_distance_flag', 'ok'),
+            pre_swc_u=getattr(bouton_map,     'swc_node_u', None),
+            pre_swc_v=getattr(bouton_map,     'swc_node_v', None),
+            post_qc_flag=getattr(post_syn_map, 'qc_distance_flag', 'ok') if post_syn_map else 'ok',
+            post_swc_u=getattr(post_syn_map,   'swc_node_u', None)       if post_syn_map else None,
+            post_swc_v=getattr(post_syn_map,   'swc_node_v', None)       if post_syn_map else None,
         )
 
     def _build_contact_row(
@@ -338,6 +352,9 @@ class ConnectivityBuilder:
             synapse_seg_id=contact_row.contact_seg_id,
             bouton_name=contact_row.bouton_name,
             bouton_seg_id=contact_row.bouton_seg_id,
+            pre_qc_flag=getattr(bouton_map, 'qc_distance_flag', 'ok'),
+            pre_swc_u=getattr(bouton_map,   'swc_node_u', None),
+            pre_swc_v=getattr(bouton_map,   'swc_node_v', None),
         )
 
     # ------------------------------------------------------------------
@@ -420,6 +437,12 @@ class ConnectivityBuilder:
                 })
 
         recipe = {
+            "metadata": {
+                "coord_frame": "physical_um_xyz",
+                # branch/pos locations use graph node IDs, not SWC row IDs.
+                # pre_swc_u/v in connectivity.csv holds the SWC row IDs if needed.
+                "branch_id_convention": "graph_node_id",
+            },
             "cell_labels": cell_labels,
             "synapses":    synapses,
             "contacts":    contacts,
