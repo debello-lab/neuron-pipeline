@@ -25,6 +25,9 @@ log = logging.getLogger("diag")
 def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    swc_dir = OUTPUT_DIR / "swc"
+    swc_dir.mkdir(parents=True, exist_ok=True)
+
     # 1. Connect to VAST
     log.info("Connecting to VAST...")
     vast = VASTControlClass()
@@ -33,67 +36,82 @@ def main() -> None:
         return
     log.info("Connected.")
 
-    # 2. Extract voxel mask
-    log.info(f"Extracting voxel mask for segment {SEGMENT_ID} (MIP {MIPLEVEL})...")
     extractor = SegmentSurfaceExtractor(vast, str(OUTPUT_DIR))
+    cleaner   = VoxelCleaner()
+    skel      = SkeletonExtractor()
+    writer    = SWCWriter()
+
+    name = str(SEGMENT_ID)
+    log.info(f"--- segment {SEGMENT_ID} ---")
+
+    # 1A. Voxel extraction
+    log.info(f"Extracting voxel mask for segment {SEGMENT_ID} (MIP {MIPLEVEL})...")
     mask, bbox_min, voxel_size, _ = extractor.extract_segment_voxel(
-            segment_id=SEGMENT_ID,
-            miplevel=MIPLEVEL,
-            padding=PADDING,
-        )
-
-    if mask is None or voxel_size is None or bbox_min is None:
-        log.error("Voxel extraction failed. Is the segment ID valid?")
-        return
-
-    log.info(
-        f"Mask shape: {mask.shape}  |  voxel size: {voxel_size} um  "
-        f"|  bbox_min: {bbox_min}  |  filled voxels: {int(mask.sum()):,}"
+        segment_id=SEGMENT_ID,
+        miplevel=MIPLEVEL,
+        padding=PADDING,
     )
 
-    # 3. Clean mask
-    log.info("Cleaning mask...")
-    cleaner = VoxelCleaner()
-    cleaned, clean_stats = cleaner.clean_mask(
+    if mask is None or voxel_size is None or bbox_min is None:
+        log.error(f"Voxel extraction failed for segment {SEGMENT_ID}")
+        return
+
+    # 1B. Cleaning -- first pass to count components
+    cleaned, stats = cleaner.clean_mask(
         mask,
-        bbox_min_vox=bbox_min,
+        closing_radius_um=2,
         keep_largest_only=True,
         fill_holes=True,
         smooth_iterations=0,
+        voxel_size_um=voxel_size,
     )
-    log.info(f"Clean stats: {clean_stats}")
 
-    # 4. Skeletonize
-    log.info("Skeletonizing...")
-    skel = SkeletonExtractor()
+    if stats['original_components'] > 1:
+        log.warning(
+            f"  {name}: {stats['original_components']} connected components "
+            f"(sizes: kept={stats['kept_components']}, removed={stats['removed_components']})"
+        )
+
+        # Re-clean keeping only the largest component
+        cleaned, stats = cleaner.clean_mask(
+            cleaned.mask,
+            closing_radius_um=2,
+            keep_largest_only=True,
+            fill_holes=False,
+            smooth_iterations=0,
+            voxel_size_um=voxel_size,
+        )
+
+    # 1C. Skeletonize voxels (includes compression, pruning, soma insertion)
     tree, skel_stats = skel.extract_skeleton(
         mask=cleaned.mask,
         voxel_size_um=voxel_size,
-        bbox_min_vox=bbox_min,
+        bbox_min_vox=cleaned.bbox_min_vox,
         spur_length_um=SPUR_UM,
     )
-
     if tree.number_of_nodes() == 0:
-        log.error("Skeletonization produced an empty tree.")
+        log.error(f"Skeletonization produced empty tree for segment {SEGMENT_ID}")
         return
 
-    log.info(f"Skeleton stats: {skel_stats}")
-
-    # 5. Write SWC
-    swc_path = OUTPUT_DIR / f"seg_{SEGMENT_ID}_mip{MIPLEVEL}.swc"
-    writer = SWCWriter()
+    # 1D. Write SWC
+    swc_path = str(swc_dir / f"cell_{name}.swc")
     writer.write_swc(
         tree=tree,
-        output_path=str(swc_path),
+        output_path=swc_path,
         metadata={
-            "segment_id":   SEGMENT_ID,
-            "miplevel":     MIPLEVEL,
-            "voxel_size_um": voxel_size,
-            "bbox_min_vox": bbox_min,
-            **{k: v for k, v in skel_stats.items()},
+            'segment_id': SEGMENT_ID,
+            'segment_name': name,
+            'miplevel': MIPLEVEL,
+            'bbox_min_vox': str(bbox_min),      # (minx, miny, minz) in voxels
+            'voxel_size_um': str(voxel_size),   # (sx, sy, sz) in µm
+            'coord_frame': 'physical_um_xyz',
+            'compressed_nodes': skel_stats.get('compressed_nodes'),
+            'spurs_pruned': skel_stats.get('branches_pruned'),
+            'total_length_um': f"{skel_stats.get('total_length_um', 0):.2f}",
         },
     )
-    log.info(f"Done. SWC written -> {swc_path}")
+
+    log.info(f"-> {swc_path}  ({tree.number_of_nodes()} nodes)")
 
 
 if __name__ == "__main__":
