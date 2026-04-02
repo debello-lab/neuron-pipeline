@@ -94,7 +94,7 @@ def run_phase1(
         # 1B. Cleaning -- first pass to count components
         cleaned, stats = cleaner.clean_mask(
                 mask,
-                closing_radius=2,
+                closing_radius_um=2,
                 keep_largest_only=True,
                 fill_holes=True,
                 smooth_iterations=0,
@@ -109,8 +109,8 @@ def run_phase1(
 
             # Re-clean keeping only the largest component
             cleaned, stats = cleaner.clean_mask(
-                mask, 
-                closing_radius=2,
+                cleaned.mask, 
+                closing_radius_um=2,
                 keep_largest_only=True, 
                 fill_holes=False, 
                 smooth_iterations=0, 
@@ -119,9 +119,9 @@ def run_phase1(
 
         # 1C. Skeletonize voxels (includes compression, pruning, soma insertion)
         tree, skel_stats = skel.extract_skeleton(
-            mask=cleaned,
+            mask=cleaned.mask,
             voxel_size_um=voxel_size,
-            bbox_min_vox=bbox_min,
+            bbox_min_vox=cleaned.bbox_min_vox,
             spur_length_um=spur_length_um,
         )
         if tree.number_of_nodes() == 0:

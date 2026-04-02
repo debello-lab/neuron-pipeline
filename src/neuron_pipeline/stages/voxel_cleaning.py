@@ -109,10 +109,13 @@ class VoxelData:
         if self.total_voxels == 0:
             raise ValueError("Extracted mask is completely empty")
         
-        if self.fill_fraction < 0.001:  # Less than 0.1% filled
+        # Fill-fraction is not a reliable check for elongated morphologies
+        # (a thin axon in a large bounding box can be << 0.1% filled and still
+        # be a valid extraction).  Use an absolute voxel floor instead.
+        if self.total_voxels < 1000:
             raise ValueError(
-                f"Mask is suspiciously sparse: {self.total_voxels}/{self.bbox_volume_voxels} voxels "
-                f"({self.fill_fraction*100:.3f}% filled). This likely indicates an extraction error."
+                f"Mask is suspiciously sparse: only {self.total_voxels} voxels filled "
+                f"({self.fill_fraction*100:.4f}% of bbox). This likely indicates an extraction error."
             )
     
     def to_physical_um(self, z_idx: int, y_idx: int, x_idx: int, 
@@ -190,7 +193,7 @@ class VoxelCleaner:
             fill_holes           : Fill internal holes / voids after closing.
             smooth_iterations    : Morphological open/close smoothing passes
                                    (0 = disabled).
-            closing_radius       : XY-voxel radius for the morphological closing
+            closing_radius_um    : XY-voxel radius for the morphological closing
                                    step that bridges annotation gaps (0 = skip).
             voxel_size_um        : (sx, sy, sz) voxel dimensions in microns.
                                    When supplied, the closing structuring element

@@ -301,16 +301,15 @@ class SegmentSurfaceExtractor:
             Tuple of (merged_vertices, merged_faces)
         """
 
-        assert faces2 is not None and faces1 is not None
         # Handle empty cases
         if verts1 is None or (isinstance(verts1, np.ndarray) and len(verts1) == 0):
             if verts2 is None or (isinstance(verts2, np.ndarray) and len(verts2) == 0):
                 return np.array([]), np.array([])
-            assert verts2 is not None
+            assert verts2 is not None and faces2 is not None
             return verts2.copy(), faces2.copy()
-        
+
         if verts2 is None or (isinstance(verts2, np.ndarray) and len(verts2) == 0):
-            assert verts1 is not None
+            assert verts1 is not None and faces1 is not None
             return verts1.copy(), faces1.copy()
         
         # Merge vertices
