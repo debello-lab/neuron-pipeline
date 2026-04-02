@@ -28,7 +28,9 @@ def main() -> None:
     # 1. Connect to VAST
     log.info("Connecting to VAST...")
     vast = VASTControlClass()
-    vast.connect(host="127.0.0.1", port=22081, timeout=100)
+    if not vast.connect(host="127.0.0.1", port=22081, timeout=100):
+        log.error("Failed to connect to VAST. Ensure VAST is running and API is enabled.")
+        return
     log.info("Connected.")
 
     # 2. Extract voxel mask
@@ -54,6 +56,7 @@ def main() -> None:
     cleaner = VoxelCleaner()
     cleaned, clean_stats = cleaner.clean_mask(
         mask,
+        bbox_min_vox=bbox_min,
         keep_largest_only=True,
         fill_holes=True,
         smooth_iterations=0,
@@ -64,7 +67,7 @@ def main() -> None:
     log.info("Skeletonizing...")
     skel = SkeletonExtractor()
     tree, skel_stats = skel.extract_skeleton(
-        mask=cleaned,
+        mask=cleaned.mask,
         voxel_size_um=voxel_size,
         bbox_min_vox=bbox_min,
         spur_length_um=SPUR_UM,

@@ -10,10 +10,11 @@ This module provides cleaning operations for both voxel masks and surface meshes
 """
 
 import numpy as np
-from typing import Tuple, Optional, Dict, Any
+from typing import Tuple, Optional, Dict, Any, Literal
 from skimage.measure import label
 from scipy.ndimage import binary_fill_holes, binary_erosion, binary_dilation, binary_closing
 import logging
+from dataclasses import dataclass
 
 
 def _make_anisotropic_structuring_element(
@@ -54,9 +55,7 @@ def _make_anisotropic_structuring_element(
     element = ((xx / rx) ** 2 + (yy / ry) ** 2 + (zz / rz) ** 2) <= 1.0
     return element.astype(bool)
 
-from dataclasses import dataclass
-from typing import Tuple, Literal
-import numpy as np
+
 
 # Explicit coordinate frame types
 CoordFrame = Literal[
@@ -172,6 +171,7 @@ class VoxelCleaner:
     def clean_mask(
         self,
         mask: np.ndarray,
+        bbox_min_vox: Tuple[int, int, int] = (0, 0, 0),
         min_component_voxels: int = 5000,
         keep_largest_only: bool = True,
         fill_holes: bool = True,
@@ -220,12 +220,6 @@ class VoxelCleaner:
         }
 
         # ------------------------------------------------------------------
-        # Step 0
-        # ------------------------------------------------------------------
-        if opening_radius > 0:
-            struct_open = _make_anisotropic_structuring_element(opening_radius, voxel_size_um)
-            cleaned_mask = binary_opening(cleaned_mask, structure=struct_open)
-        # ------------------------------------------------------------------
         # Step 1: Morphological closing
         #
         # Bridges gaps left by incomplete annotation fill so that interior
@@ -256,13 +250,6 @@ class VoxelCleaner:
                 f"(structuring element shape: {struct.shape})"
             )
         
-        if voxel_size_um:
-            sx, sy, sz = voxel_size_um
-            avg_voxel_um = (sx + sy) / 2.0  # Use XY average since closing_radius is described as "XY voxels"
-            closing_radius_vox = max(1, int(np.round(closing_radius_um / avg_voxel_um)))
-        else:
-            closing_radius_vox = closing_radius_um  # Fallback to voxel units if no calibration
-
         # ------------------------------------------------------------------
         # Step 2: Component filtering
         # ------------------------------------------------------------------
@@ -273,7 +260,7 @@ class VoxelCleaner:
 
         if num_components == 0:
             self.logger.warning("[clean_masks] Input mask is empty after closing")
-            return cleaned_mask, stats
+            raise ValueError("Input mask is empty after closing — no components found")
 
         component_sizes = np.bincount(labeled_mask.ravel())
         component_sizes[0] = 0   # exclude background
@@ -346,8 +333,8 @@ class VoxelCleaner:
 
         return VoxelData(
             mask=cleaned_mask,
-            bbox_min_vox=voxel_data.bbox_min_vox,  # Preserved
-            voxel_size_um=voxel_data.voxel_size_um,  # Preserved
+            bbox_min_vox=bbox_min_vox,
+            voxel_size_um=voxel_size_um or (1.0, 1.0, 1.0),
         ), stats
 
     def get_largest_component(self, mask: np.ndarray) -> np.ndarray:
@@ -469,10 +456,10 @@ def quick_clean_mask(
         mask,
         keep_largest_only=keep_largest,
         fill_holes=fill_holes,
-        closing_radius=closing_radius,
+        closing_radius_um=closing_radius,
         voxel_size_um=voxel_size_um,
     )
-    return cleaned
+    return cleaned.mask
 
 
 def quick_clean_mesh(
