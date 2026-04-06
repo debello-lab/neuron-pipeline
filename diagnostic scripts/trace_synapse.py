@@ -263,7 +263,7 @@ def main():
     skel_extractor = SkeletonExtractor()
     writer        = SWCWriter()
 
-    # ── PRE-SYNAPTIC (BOUTON → AXON) ─────────────────────────────────────────
+    # ── PRE-SYNAPTIC (BOUTON -> AXON) ─────────────────────────────────────────
     # The pipeline uses the BOUTON centroid for the axon-side cable location,
     # not the synapse centroid. The synapse sits at the cleft and can be several
     # µm from the axon cable — that is expected biology, not a coordinate error.
@@ -352,7 +352,7 @@ def main():
     ax.set_xlabel('X (µm)')
     ax.set_ylabel('Y (µm)')
     ax.set_zlabel('Z (µm)')
-    plt.title('Synapse → Axon Mapping')
+    plt.title('Synapse -> Axon Mapping')
     plt.show()
 
 

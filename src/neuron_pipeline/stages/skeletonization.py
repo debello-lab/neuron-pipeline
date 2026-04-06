@@ -75,7 +75,7 @@ class SkeletonExtractor:
             'compressed_edges': 0,
             'branches_pruned': 0,
             'total_length_um': 0.0,
-            'coord_frame': 'physical_um_xyz',
+            'coord_frame': 'physical_um_xyz_center',
         }
 
         if not np.any(mask):
@@ -194,14 +194,14 @@ class SkeletonExtractor:
 
         for i, coord in enumerate(skel_coords):
             z, y, x = coord   # local voxel indices from np.argwhere — ZYX order
-            # Step 1: local → global voxel (add bbox origin; bbox_min_vox = (minx, miny, minz))
+            # Step 1: local -> global voxel (add bbox origin; bbox_min_vox = (minx, miny, minz))
             global_x_vox = x + minx
             global_y_vox = y + miny
             global_z_vox = z + minz
-            # Step 2: global voxel → physical µm (voxel_size_um = (sx, sy, sz), X first)
-            pos_x_um = global_x_vox * sx
-            pos_y_um = global_y_vox * sy
-            pos_z_um = global_z_vox * sz
+            # Step 2: global voxel -> physical µm (voxel_size_um = (sx, sy, sz), X first)
+            pos_x_um = (global_x_vox + 0.5) * sx
+            pos_y_um = (global_y_vox + 0.5) * sy
+            pos_z_um = (global_z_vox + 0.5) * sz
             G.add_node(i, pos=(pos_x_um, pos_y_um, pos_z_um), voxel_pos=coord)
 
         for i, coord in enumerate(skel_coords):
@@ -520,7 +520,7 @@ class SkeletonExtractor:
         # Tag the graph with its coordinate frame so Phase 3 can assert
         # that skeleton and centroid coordinates are in the same space.
         # Convention: physical micrometres, axis order (X, Y, Z).
-        tree.graph['coord_frame'] = 'physical_um_xyz'
+        tree.graph['coord_frame'] = 'physical_um_xyz_center'
 
         self.logger.info(
             f"Tree: {tree.number_of_nodes()} nodes, {tree.number_of_edges()} edges"
@@ -702,7 +702,7 @@ class SWCWriter:
             )
             node_swc_id = swc_id
             # Stamp the SWC row ID back onto the node so Phase 3 can resolve
-            # graph node IDs → SWC row numbers without a second traversal.
+            # graph node IDs -> SWC row numbers without a second traversal.
             tree.nodes[node]['swc_id'] = node_swc_id
             swc_id += 1
 

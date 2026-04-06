@@ -69,7 +69,7 @@ class CableMappingEntry:
     distance_um: float          # Euclidean distance centroid -> cable
 
     # Coordinate frame and QC
-    coord_frame: str = 'physical_um_xyz'
+    coord_frame: str = 'physical_um_xyz_center'
     # Distance QC tier: 'ok' (<ok_distance_um), 'warn', 'suspicious' (>=warn_distance_um)
     qc_distance_flag: str = 'ok'
     # SWC row IDs stamped by SWCWriter onto the tree nodes in Phase 1.
@@ -492,7 +492,7 @@ class CentroidMapper:
           - Phase 1 (graph_to_tree): tree.graph['coord_frame']
           - Phase 2 (CentroidEntry): entry.coord_frame  (default 'physical_um_xyz')
         """
-        expected = 'physical_um_xyz'
+        expected = 'physical_um_xyz_center'
 
         for cell_name, (tree, _) in trees.items():
             frame = tree.graph.get('coord_frame')

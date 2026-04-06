@@ -140,7 +140,7 @@ def run_phase1(
                 'miplevel': miplevel,
                 'bbox_min_vox': str(bbox_min),      # (minx, miny, minz) in voxels
                 'voxel_size_um': str(voxel_size),   # (sx, sy, sz) in µm
-                'coord_frame': 'physical_um_xyz',
+                'coord_frame': 'physical_um_xyz_center',
                 'compressed_nodes': skel_stats.get('compressed_nodes'),
                 'spurs_pruned': skel_stats.get('branches_pruned'),
                 'total_length_um': f"{skel_stats.get('total_length_um', 0):.2f}",

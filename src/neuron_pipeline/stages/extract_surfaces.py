@@ -795,9 +795,9 @@ class SegmentSurfaceExtractor:
         #
         # The binary_volume axis order matches the VAST return convention: (Z,Y,X).
         # Boundary flags therefore map as:
-        #   axis 0 = Z:  at_min_z → pad front,  at_max_z → pad back
-        #   axis 1 = Y:  at_min_y → pad top,    at_max_y → pad bottom
-        #   axis 2 = X:  at_min_x → pad left,   at_max_x → pad right
+        #   axis 0 = Z:  at_min_z -> pad front,  at_max_z -> pad back
+        #   axis 1 = Y:  at_min_y -> pad top,    at_max_y -> pad bottom
+        #   axis 2 = X:  at_min_x -> pad left,   at_max_x -> pad right
         offset_adjust = np.array([0, 0, 0])
         if close_surfaces and needs_close:
             self.logger.debug("Padding dataset-boundary faces with zeros for surface closure")

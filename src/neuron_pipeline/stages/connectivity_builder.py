@@ -130,15 +130,15 @@ class ConnectivityBuilder:
     Synapse resolution
     ------------------
     Each SYNAPSE segment (A1B2P1S1) defines a confirmed connection:
-      - presynaptic  location → cable mapping of the parent BOUTON  (A1B2)
-      - postsynaptic location → cable mapping of the parent POST_SYN (A1B2P1)
+      - presynaptic  location -> cable mapping of the parent BOUTON  (A1B2)
+      - postsynaptic location -> cable mapping of the parent POST_SYN (A1B2P1)
 
     Contact resolution
     ------------------
     Each CONTACT segment (A1B2X1) defines a potential (unconfirmed) contact:
-      - presynaptic  location → cable mapping of the parent BOUTON  (A1B2)
-      - postsynaptic location → not available (no POST_SYN defined)
-        → post_* fields are left as empty / -1
+      - presynaptic  location -> cable mapping of the parent BOUTON  (A1B2)
+      - postsynaptic location -> not available (no POST_SYN defined)
+        -> post_* fields are left as empty / -1
 
     Both are written to connectivity.csv; contacts are flagged in the
     connection_type column and omitted from the Arbor synapses list
@@ -438,7 +438,7 @@ class ConnectivityBuilder:
 
         recipe = {
             "metadata": {
-                "coord_frame": "physical_um_xyz",
+                "coord_frame": "physical_um_xyz_center",
                 # branch/pos locations use graph node IDs, not SWC row IDs.
                 # pre_swc_u/v in connectivity.csv holds the SWC row IDs if needed.
                 "branch_id_convention": "graph_node_id",

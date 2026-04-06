@@ -18,7 +18,7 @@ from dataclasses import dataclass
 
 
 def _make_anisotropic_structuring_element(
-    radius_xy: int,
+    radius_xy: float,
     voxel_size_um: Optional[Tuple[float, float, float]] = None,
 ) -> np.ndarray:
     """
@@ -62,7 +62,7 @@ CoordFrame = Literal[
     'vast_global_voxel_xyz',      # VAST dataset space, corner-of-voxel, (x,y,z) ordering
     'local_bbox_voxel_xyz',       # Bounding-box-relative, corner-of-voxel, (x,y,z)
     'numpy_array_index_zyx',      # NumPy array indices, (z,y,x) ordering
-    'physical_um_xyz',            # Physical micrometers, center-of-voxel, (x,y,z)
+    'physical_um_xyz_center',     # Physical micrometers, center-of-voxel, (x,y,z)
 ]
 
 @dataclass
@@ -131,19 +131,19 @@ class VoxelData:
         Returns:
             (x_um, y_um, z_um) in physical space
         """
-        # Step 1: Array index → local voxel coordinate
+        # Step 1: Array index -> local voxel coordinate
         # (add 0.5 for center-of-voxel convention)
         offset = 0.5 if use_voxel_centers else 0.0
         local_x = x_idx + offset
         local_y = y_idx + offset
         local_z = z_idx + offset
         
-        # Step 2: Local voxel → global voxel (add bbox origin)
+        # Step 2: Local voxel -> global voxel (add bbox origin)
         global_x_vox = local_x + self.bbox_min_vox[0]
         global_y_vox = local_y + self.bbox_min_vox[1]
         global_z_vox = local_z + self.bbox_min_vox[2]
         
-        # Step 3: Global voxel → physical µm (scale by voxel size)
+        # Step 3: Global voxel -> physical µm (scale by voxel size)
         x_um = global_x_vox * self.voxel_size_um[0]
         y_um = global_y_vox * self.voxel_size_um[1]
         z_um = global_z_vox * self.voxel_size_um[2]
@@ -244,7 +244,7 @@ class VoxelCleaner:
                 closing_radius_um, voxel_size_um
             )
             pre_close = int(np.sum(cleaned_mask))
-            cleaned_mask = binary_closing(cleaned_mask, structure=struct)
+            cleaned_mask = binary_closing(cleaned_mask, structure=struct) | mask.astype(bool)
             post_close = int(np.sum(cleaned_mask))
             added = post_close - pre_close
             stats['closing_voxels_added'] = added

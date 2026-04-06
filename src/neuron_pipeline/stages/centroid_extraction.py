@@ -49,7 +49,7 @@ class CentroidEntry:
     # Coordinate frame tag -- must match the skeleton tree's coord_frame
     # attribute set in Phase 1 (graph_to_tree). Phase 3 asserts equality
     # before building the KDTree to catch silent space mismatches.
-    coord_frame: str = 'physical_um_xyz'
+    coord_frame: str = 'physical_um_xyz_center'
 
 
 @dataclass
@@ -245,19 +245,17 @@ class CentroidExtractor:
         # mask is (Z, Y, X) following numpy convention; np.where returns in that order.
         z_idx, y_idx, x_idx = np.where(mask)
 
-        # Step 1 — local centroid in voxel space (relative to the extracted sub-volume)
+        # Step 1 - local centroid in voxel space (relative to the extracted sub-volume)
         local_cx_vox = x_idx.mean()
         local_cy_vox = y_idx.mean()
         local_cz_vox = z_idx.mean()
 
-        # Step 2 — global voxel space (add bbox origin: bbox_min_vox = (minx, miny, minz))
-        global_cx_vox = local_cx_vox + bbox_min_vox[0]
-        global_cy_vox = local_cy_vox + bbox_min_vox[1]
-        global_cz_vox = local_cz_vox + bbox_min_vox[2]
+        # Step 2 - global voxel space (add bbox origin: bbox_min_vox = (minx, miny, minz)), add 0.5 for center of voxel standard convention
+        global_cx_vox = (local_cx_vox + 0.5) + bbox_min_vox[0]
+        global_cy_vox = (local_cy_vox + 0.5) + bbox_min_vox[1]
+        global_cz_vox = (local_cz_vox + 0.5) + bbox_min_vox[2]
 
-        # Step 3 — physical µm (voxel_size_um = (sx, sy, sz); corner-of-voxel convention)
-        # For centre-of-voxel, add 0.5 to each local index before step 2:
-        #   global_cx_vox = (local_cx_vox + 0.5) + bbox_min_vox[0]  etc.
+        # Step 3 - physical µm (voxel_size_um = (sx, sy, sz); center-of-voxel convention)
         cx_um = float(global_cx_vox * voxel_size_um[0])
         cy_um = float(global_cy_vox * voxel_size_um[1])
         cz_um = float(global_cz_vox * voxel_size_um[2])
@@ -297,9 +295,9 @@ class CentroidExtractor:
         sy = di['voxelsizey'] / 1000.0
         sz = di['voxelsizez'] / 1000.0
 
-        cx_um = float((bbox[0] + bbox[3]) / 2.0 * sx)
-        cy_um = float((bbox[1] + bbox[4]) / 2.0 * sy)
-        cz_um = float((bbox[2] + bbox[5]) / 2.0 * sz)
+        cx_um = float(((bbox[0] + bbox[3]) / 2.0 + 0.5) * sx)
+        cy_um = float(((bbox[1] + bbox[4]) / 2.0 + 0.5) * sy)
+        cz_um = float(((bbox[2] + bbox[5]) / 2.0 + 0.5) * sz)
 
         return CentroidEntry(
             name=info.name,
@@ -332,9 +330,9 @@ class CentroidExtractor:
             sx = di['voxelsizex'] / 1000.0
             sy = di['voxelsizey'] / 1000.0
             sz = di['voxelsizez'] / 1000.0
-            cx_um = float(ap[0] * sx)
-            cy_um = float(ap[1] * sy)
-            cz_um = float(ap[2] * sz)
+            cx_um = float((ap[0] + 0.5) * sx)
+            cy_um = float((ap[1] + 0.5) * sy)
+            cz_um = float((ap[2] + 0.5) * sz)
         else:
             cx_um = cy_um = cz_um = 0.0
 
