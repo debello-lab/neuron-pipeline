@@ -31,20 +31,27 @@ class SegmentSurfaceExtractor:
     - Production-grade quality assurance
     """
     
-    def __init__(self, vast: VASTControlClass, output_dir: str = "./output"):
+    def __init__(self, vast: VASTControlClass, output_dir: str = "./output",
+                 logger: Optional[logging.Logger] = None):
         """
         Initialize the extractor.
-        
+
         Args:
             vast: Connected VASTControlClass instance
             output_dir: Base directory for output files
+            logger: Shared pipeline logger. If provided, used directly and no
+                    per-instance log file is created. If None, a per-instance
+                    file logger is created (legacy behaviour).
         """
         self.vast = vast
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        
+
         # Setup logging
-        self._setup_logging()
+        if logger is not None:
+            self.logger = logger
+        else:
+            self._setup_logging()
         
         # Cache dataset info
         self.dataset_info: Dict[str, Any] = None  # type: ignore
