@@ -256,6 +256,32 @@ def log_comparison_table(all_metrics: List[Dict]) -> None:
 # Helpers
 # ---------------------------------------------------------------------------
 
+def mask_to_npz(
+    mask: np.ndarray,
+    voxel_size_um: tuple,
+    bbox_min_vox: tuple,
+    segment_id: int,
+    segment_name: str,
+    filepath: Path,
+) -> None:
+    """
+    Save a voxel mask and spatial metadata to a compressed .npz file.
+
+    Saved arrays match the format written by extract_surfaces._save_voxel_mask
+    so the file can be loaded by other pipeline tools (e.g. view_mask_slices.py).
+    """
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        filepath,
+        mask=mask,
+        bbox_min_vox=np.array(bbox_min_vox),
+        voxel_size_um=np.array(voxel_size_um),
+        segment_id=segment_id,
+        segment_name=segment_name,
+    )
+    log.info(f"  Saved {filepath.name}  ({int(mask.sum()):,} filled voxels)")
+
+
 def mask_to_obj(
     mask: np.ndarray,
     voxel_size_um: tuple,
@@ -304,6 +330,9 @@ def mask_to_obj(
 def run_stage_tests(
     mask: np.ndarray,
     voxel_size_um: tuple,
+    bbox_min_vox: tuple,
+    segment_id: int,
+    segment_name: str,
     output_dir: Path,
     prefix: str,
 ) -> None:
@@ -321,6 +350,7 @@ def run_stage_tests(
     # ------------------------------------------------------------------
     log.info(f"[{prefix}] Stage 00 — raw mask ({int(mask.sum()):,} filled voxels)")
     mask_to_obj(mask, voxel_size_um, output_dir / f"{prefix}_00_raw.obj")
+    mask_to_npz(mask, voxel_size_um, bbox_min_vox, segment_id, segment_name, output_dir / f"{prefix}_00_raw.npz")
     all_metrics.append(run_quantitative_checks(mask, "00_raw"))
 
     # ------------------------------------------------------------------
@@ -343,6 +373,7 @@ def run_stage_tests(
         f"components={stats01['original_components']}"
     )
     mask_to_obj(vd01.mask, voxel_size_um, output_dir / f"{prefix}_01_closing.obj")
+    mask_to_npz(vd01.mask, voxel_size_um, bbox_min_vox, segment_id, segment_name, output_dir / f"{prefix}_01_closing.npz")
     all_metrics.append(run_quantitative_checks(vd01.mask, "01_closing"))
 
     # ------------------------------------------------------------------
@@ -362,6 +393,7 @@ def run_stage_tests(
         f"kept={stats02['kept_components']}"
     )
     mask_to_obj(vd02.mask, voxel_size_um, output_dir / f"{prefix}_02_components.obj")
+    mask_to_npz(vd02.mask, voxel_size_um, bbox_min_vox, segment_id, segment_name, output_dir / f"{prefix}_02_components.npz")
     all_metrics.append(run_quantitative_checks(vd02.mask, "02_components"))
 
     # ------------------------------------------------------------------
@@ -381,6 +413,7 @@ def run_stage_tests(
         f"final={stats03['final_voxel_count']:,} voxels"
     )
     mask_to_obj(vd03.mask, voxel_size_um, output_dir / f"{prefix}_03_holefill.obj")
+    mask_to_npz(vd03.mask, voxel_size_um, bbox_min_vox, segment_id, segment_name, output_dir / f"{prefix}_03_holefill.npz")
     all_metrics.append(run_quantitative_checks(vd03.mask, "03_holefill"))
 
     # ------------------------------------------------------------------
@@ -428,9 +461,13 @@ def main() -> None:
     log.info("=" * 60)
     log.info("TEST 1: Full neuron")
     log.info("=" * 60)
+    seg_name = f"seg_{SEGMENT_ID}"
     run_stage_tests(
         mask=mask,
         voxel_size_um=voxel_size,
+        bbox_min_vox=bbox_min,
+        segment_id=SEGMENT_ID,
+        segment_name=seg_name,
         output_dir=OUTPUT_DIR / "full",
         prefix="full",
     )
@@ -461,6 +498,9 @@ def main() -> None:
             run_stage_tests(
                 mask=slice_mask,
                 voxel_size_um=voxel_size,
+                bbox_min_vox=bbox_min,
+                segment_id=SEGMENT_ID,
+                segment_name=seg_name,
                 output_dir=OUTPUT_DIR / "slice",
                 prefix="slice",
             )

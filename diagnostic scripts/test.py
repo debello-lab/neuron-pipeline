@@ -75,10 +75,10 @@ def main() -> None:
         # Re-clean keeping only the largest component
         cleaned, stats = cleaner.clean_mask(
             cleaned.mask,
-            closing_radius_um=2,
-            keep_largest_only=True,
+            closing_radius_um=1,
+            keep_largest_only=False,
             fill_holes=False,
-            smooth_iterations=0,
+            smooth_iterations=1,
             voxel_size_um=voxel_size,
         )
 

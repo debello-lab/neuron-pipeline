@@ -94,8 +94,8 @@ def load_mask(npz_path: str):
     bbox_min_vox = tuple(data['bbox_min_vox'])
     voxel_size   = tuple(data['voxel_size_um'])
     seg_id       = int(data['segment_id'])
-    seg_name     = str(data['segment_name'])
-    return mask, bbox_min_vox, voxel_size, seg_id, seg_name
+    # seg_name     = str(data['segment_name'])
+    return mask, bbox_min_vox, voxel_size, seg_id, ""
 
 
 # ---------------------------------------------------------------------------
