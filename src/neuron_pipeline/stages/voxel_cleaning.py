@@ -17,6 +17,38 @@ import logging
 from dataclasses import dataclass
 
 
+def _fill_holes_multiaxis(mask: np.ndarray) -> np.ndarray:
+    """
+    Fill holes by applying binary_fill_holes along each of the three axes
+    independently and taking the union of all three results with the original.
+
+    Rationale: scipy's binary_fill_holes requires a void to be fully enclosed
+    in 3D.  Elongated internal voids (e.g. a gap running along Z) may be open
+    at their ends in 3D — not enclosed — but appear as closed holes in every
+    XY cross-section.  Filling per-slice catches these cases.
+
+    This is intentionally more aggressive than a 3D-only fill.  Use the
+    `fill_holes_per_axis` flag in clean_mask to opt in.
+
+    Args:
+        mask: Boolean 3D array (Z, Y, X).
+
+    Returns:
+        Boolean 3D array with axis-wise holes filled (superset of input).
+    """
+    result = mask.copy()
+    # Fill along Z axis (each XY slice independently)
+    for z in range(mask.shape[0]):
+        result[z] |= binary_fill_holes(mask[z])
+    # Fill along Y axis (each XZ slice independently)
+    for y in range(mask.shape[1]):
+        result[:, y, :] |= binary_fill_holes(mask[:, y, :])
+    # Fill along X axis (each YZ slice independently)
+    for x in range(mask.shape[2]):
+        result[:, :, x] |= binary_fill_holes(mask[:, :, x])
+    return result
+
+
 def _make_anisotropic_structuring_element(
     radius_xy: float,
     voxel_size_um: Optional[Tuple[float, float, float]] = None,
@@ -178,8 +210,10 @@ class VoxelCleaner:
         min_component_voxels: int = 5000,
         keep_largest_only: bool = True,
         fill_holes: bool = True,
+        fill_holes_per_axis: bool = False,
         smooth_iterations: int = 0,
         closing_radius_um: float = 1.0,
+        closing_iterations: int = 1,
         voxel_size_um: Optional[Tuple[float, float, float]] = None,
     ) -> Tuple[VoxelData, Dict[str, Any]]:
         """
@@ -190,11 +224,31 @@ class VoxelCleaner:
             min_component_voxels : Minimum component size to keep when
                                    keep_largest_only=False.
             keep_largest_only    : Keep only the largest connected component.
-            fill_holes           : Fill internal holes / voids after closing.
+            fill_holes           : Fill internal holes / voids after closing
+                                   using a 3D flood-fill from the exterior.
+                                   Only seals voids that are fully enclosed in
+                                   3D after the closing step.
+            fill_holes_per_axis  : Additionally fill holes in each 2D slice
+                                   along Z, Y, and X and union the results.
+                                   More aggressive than the 3D fill alone —
+                                   catches elongated voids that are open-ended
+                                   in 3D (e.g. a gap running the length of a
+                                   dendrite) but appear closed in cross-section.
+                                   Requires fill_holes=True.  Safe to enable for
+                                   messy segmentations; may over-fill on very
+                                   sparse or C-shaped structures.
             smooth_iterations    : Morphological open/close smoothing passes
                                    (0 = disabled).
             closing_radius_um    : XY-voxel radius for the morphological closing
                                    step that bridges annotation gaps (0 = skip).
+                                   Increase for larger surface discontinuities
+                                   (e.g. 3–5 for coarse EM segmentations).
+            closing_iterations   : Number of closing passes to apply.  A single
+                                   pass bridges gaps up to ~radius_um.  Multiple
+                                   passes with the same element progressively
+                                   seal more complex gap patterns and are cheaper
+                                   than one very large element.  Typical range:
+                                   1 (default) to 3 for messy inputs.
             voxel_size_um        : (sx, sy, sz) voxel dimensions in microns.
                                    When supplied, the closing structuring element
                                    is scaled to be isotropic in physical space,
@@ -203,6 +257,22 @@ class VoxelCleaner:
 
         Returns:
             Tuple of (cleaned_mask, stats)
+
+        Tuning guide for messy segmentations
+        -------------------------------------
+        Internal gaps (voids inside the neuron body):
+          • Increase closing_radius_um so the shell gaps get bridged before
+            hole filling (start at 2–4 XY voxels).
+          • Enable fill_holes_per_axis=True to catch elongated open voids that
+            the 3D filler misses.
+          • Use closing_iterations=2 or 3 if a single pass is insufficient.
+
+        Borders that do not touch (surface discontinuities):
+          • Increase closing_radius_um — the closing diameter must exceed the
+            physical gap width.
+          • Increase closing_iterations to reach gaps through narrow passages.
+          • After cleaning, inspect stats['closing_voxels_added'] per iteration
+            to judge whether additional passes are still contributing.
         """
         self.logger.info("[clean_masks] Starting mask cleaning...")
 
@@ -214,8 +284,10 @@ class VoxelCleaner:
             'kept_components': 0,
             'removed_components': 0,
             'closing_voxels_added': 0,
+            'closing_iterations_run': 0,
             'holes_filled': False,
             'hole_fill_voxels_added': 0,
+            'per_axis_fill_voxels_added': 0,
             'smoothing_iterations': smooth_iterations,
             'final_voxel_count': 0,
             'voxels_added': 0,
@@ -223,7 +295,7 @@ class VoxelCleaner:
         }
 
         # ------------------------------------------------------------------
-        # Step 1: Morphological closing
+        # Step 1: Morphological closing (iterated)
         #
         # Bridges gaps left by incomplete annotation fill so that interior
         # voids are enclosed (not connected to the exterior) before we call
@@ -233,26 +305,47 @@ class VoxelCleaner:
         # A physically-isotropic ellipsoidal structuring element is used so
         # that the closing distance is the same in XY and Z regardless of
         # voxel anisotropy.
+        #
+        # Multiple iterations bridge progressively more complex gap patterns;
+        # each pass operates on the output of the previous one, so iteration N
+        # can reach gaps that were blocked by unfilled voids in iteration N-1.
+        # The original voxels are OR-ed back in after every pass to prevent the
+        # dilation half of closing from erasing true signal at the boundary.
         # ------------------------------------------------------------------
         cleaned_mask = mask.astype(bool)
 
-        if closing_radius_um > 0:
-            self.logger.info(
-                f"[clean_masks] Morphological closing (radius={closing_radius_um} XY voxels)..."
-            )
+        if closing_radius_um > 0 and closing_iterations > 0:
             struct = _make_anisotropic_structuring_element(
                 closing_radius_um, voxel_size_um
             )
-            pre_close = int(np.sum(cleaned_mask))
-            cleaned_mask = binary_closing(cleaned_mask, structure=struct) | mask.astype(bool)
-            post_close = int(np.sum(cleaned_mask))
-            added = post_close - pre_close
-            stats['closing_voxels_added'] = added
             self.logger.info(
-                f"[clean_masks]  Closing bridged gaps: +{added:,} voxels "
-                f"(structuring element shape: {struct.shape})"
+                f"[clean_masks] Morphological closing "
+                f"(radius={closing_radius_um} XY voxels, "
+                f"iterations={closing_iterations}, "
+                f"struct shape={struct.shape})..."
             )
-        
+            total_added = 0
+            for i in range(closing_iterations):
+                pre = int(np.sum(cleaned_mask))
+                closed = binary_closing(cleaned_mask, structure=struct)
+                # OR with original to preserve true signal at borders
+                cleaned_mask = closed | mask.astype(bool)
+                added = int(np.sum(cleaned_mask)) - pre
+                total_added += added
+                self.logger.info(
+                    f"[clean_masks]  Closing pass {i + 1}/{closing_iterations}: "
+                    f"+{added:,} voxels bridged"
+                )
+                if added == 0:
+                    self.logger.info(
+                        "[clean_masks]  No new voxels bridged — stopping early"
+                    )
+                    stats['closing_iterations_run'] = i + 1
+                    break
+            else:
+                stats['closing_iterations_run'] = closing_iterations
+            stats['closing_voxels_added'] = total_added
+
         # ------------------------------------------------------------------
         # Step 2: Component filtering
         # ------------------------------------------------------------------
@@ -289,28 +382,56 @@ class VoxelCleaner:
                 f">= {min_component_voxels:,} voxels"
             )
 
-        cleaned_mask = np.isin(labeled_mask, keep_ids)
+        cleaned_mask = np.isin(labeled_mask, keep_ids).astype(bool)
         stats['kept_components'] = len(keep_ids)
         stats['removed_components'] = num_components - len(keep_ids)
 
         # ------------------------------------------------------------------
         # Step 3: Fill holes
         #
-        # Now that closing has sealed gaps in the shell, fill_holes will
-        # correctly identify and fill all enclosed interior voids.
+        # 3a. 3D fill — scipy flood-fills from the exterior; seals voids that
+        #     are fully enclosed in 3D after closing.
+        #
+        # 3b. Per-axis 2D fill (optional) — fills holes in every cross-section
+        #     slice along Z, Y, and X independently, then unions the results.
+        #     This catches elongated voids (e.g. a gap running along the axis
+        #     of a dendrite) that appear open-ended in 3D but are closed in
+        #     every 2D cross-section.  Apply after the 3D fill so the 3D fill
+        #     handles the easy cases first and per-axis fill only contributes
+        #     the incremental difference.
         # ------------------------------------------------------------------
         if fill_holes:
-            self.logger.info("[clean_masks] Filling internal holes and voids...")
+            self.logger.info("[clean_masks] Filling internal holes and voids (3D)...")
             pre_fill = int(np.sum(cleaned_mask))
-            cleaned_mask = binary_fill_holes(cleaned_mask)
+            filled = binary_fill_holes(cleaned_mask)
+            assert filled is not None, "binary_fill_holes returned None"
+            cleaned_mask = filled.astype(bool)
             post_fill = int(np.sum(cleaned_mask))
-            added = post_fill - pre_fill
+            added_3d = post_fill - pre_fill
             stats['holes_filled'] = True
-            stats['hole_fill_voxels_added'] = added
-            if added > 0:
-                self.logger.info(f"[clean_masks]  Filled voids: +{added:,} voxels")
+            stats['hole_fill_voxels_added'] = added_3d
+            if added_3d > 0:
+                self.logger.info(f"[clean_masks]  3D fill: +{added_3d:,} voxels")
             else:
-                self.logger.info("[clean_masks]  No unfilled voids found (closing handled them)")
+                self.logger.info("[clean_masks]  3D fill: no enclosed voids found")
+
+            if fill_holes_per_axis:
+                self.logger.info(
+                    "[clean_masks] Per-axis 2D hole filling (Z, Y, X slices)..."
+                )
+                pre_axis = int(np.sum(cleaned_mask))
+                cleaned_mask = _fill_holes_multiaxis(cleaned_mask)
+                added_axis = int(np.sum(cleaned_mask)) - pre_axis
+                stats['per_axis_fill_voxels_added'] = added_axis
+                if added_axis > 0:
+                    self.logger.info(
+                        f"[clean_masks]  Per-axis fill caught additional "
+                        f"+{added_axis:,} voxels not enclosed in 3D"
+                    )
+                else:
+                    self.logger.info(
+                        "[clean_masks]  Per-axis fill: no additional voids found"
+                    )
 
         # ------------------------------------------------------------------
         # Step 4: Morphological smoothing (optional surface regularisation)
@@ -318,12 +439,16 @@ class VoxelCleaner:
         if smooth_iterations > 0:
             self.logger.info(f"[clean_masks] Smoothing ({smooth_iterations} iterations)...")
             for _ in range(smooth_iterations):
-                cleaned_mask = binary_erosion(cleaned_mask)
-                cleaned_mask = binary_dilation(cleaned_mask)
+                eroded = binary_erosion(cleaned_mask)
+                assert eroded is not None
+                dilated = binary_dilation(eroded.astype(bool))
+                assert dilated is not None
+                cleaned_mask = dilated.astype(bool)
 
         # ------------------------------------------------------------------
         # Final stats
         # ------------------------------------------------------------------
+        assert isinstance(cleaned_mask, np.ndarray), "cleaned_mask is not an ndarray"
         final_voxel_count = int(np.sum(cleaned_mask))
         stats['final_voxel_count'] = final_voxel_count
         stats['voxels_added'] = max(0, final_voxel_count - original_voxel_count)
