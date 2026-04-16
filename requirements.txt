@@ -11,6 +11,3 @@ numpy
 scipy
 scikit-image
 networkx
-
-# Optional: used in diagnostic scripts/mcf.py for MCF-based skeletonization comparison
-# mcf2swc
