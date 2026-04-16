@@ -59,7 +59,7 @@ def main() -> None:
     # 1B. Cleaning -- first pass to count components
     cleaned, stats = cleaner.clean_mask(
         mask,
-        closing_radius_um=2,
+        closing_radius_um=1.2,
         keep_largest_only=True,
         fill_holes=True,
         smooth_iterations=0,
@@ -75,10 +75,10 @@ def main() -> None:
         # Re-clean keeping only the largest component
         cleaned, stats = cleaner.clean_mask(
             cleaned.mask,
-            closing_radius_um=1,
+            closing_radius_um=1.2,
             keep_largest_only=False,
             fill_holes=False,
-            smooth_iterations=1,
+            smooth_iterations=0,
             voxel_size_um=voxel_size,
         )
 
