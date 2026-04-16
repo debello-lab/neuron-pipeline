@@ -12,10 +12,12 @@ Pipeline phases:
   Phase 3  Map centroids to SWC cable locations
   Phase 4  Connectivity CSV + Arbor recipe generation
 """
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+
 import logging
 import re
 import traceback
@@ -66,7 +68,7 @@ class WarningRecord:
     severity: str = 'medium'  # 'low' | 'medium' | 'high'
 
 # ---------------------------------------------------------------------------
-# Centralized logger setup
+# Logger setup
 # ---------------------------------------------------------------------------
 
 def setup_pipeline_logger(output_dir: str) -> logging.Logger:
@@ -159,6 +161,54 @@ def log_phase_summary(logger: logging.Logger, phase_name: str, total: int,
     logger.info("=" * 80)
     logger.info("")
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _write_review_queue(
+    entries: List[dict],
+    output_dir: str,
+    logger: logging.Logger,
+) -> None:
+    """
+    Write (or append to) review_queue.csv for segments that need human inspection.
+
+    Each entry represents a segment where automated cleaning produced suspicious
+    metrics — either a high closing fraction (closing added >20% of volume) or
+    residual fragmentation (multiple components remained after cleaning).
+
+    The file appends on re-runs so successive pipeline runs accumulate the queue.
+    Use diag_cleaning_param_sweep.py to inspect flagged segments individually.
+    """
+    import csv as _csv
+
+    if not entries:
+        return
+
+    path = Path(output_dir) / "review_queue.csv"
+    fieldnames = [
+        'segment_name', 'segment_id', 'role', 'reason',
+        'closing_radius_um', 'original_voxels', 'closing_voxels_added',
+        'closing_fraction', 'components_after_clean', 'recommended_action',
+    ]
+
+    write_header = not path.exists()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, 'a', newline='') as f:
+        writer = _csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        writer.writerows(entries)
+
+    logger.info(
+        f"Review queue: {len(entries)} segment(s) flagged for inspection "
+        f"-> {path}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phases
+# ---------------------------------------------------------------------------
 
 #  Phase 1
 
@@ -206,6 +256,12 @@ def run_phase1(
     results: Dict[str, Tuple[nx.DiGraph, str]] = {}
     failures: List[FailureRecord] = []
     warnings: List[WarningRecord] = []
+    review_queue_entries: List[dict] = []
+
+    # Closing fraction threshold: warn if closing added >20% of original volume.
+    # A large fraction means the closing radius is bridging more than surface gaps.
+    # Flagged segments are written to review_queue.csv for human inspection.
+    CLOSING_FRACTION_WARN = 0.20
 
     for name, info in targets:
         logger.info(f"--- {info.role} {name} (seg {info.seg_id}) ---")
@@ -236,12 +292,40 @@ def run_phase1(
             # 1B. Cleaning -- first pass to count components
             cleaned, stats = cleaner.clean_mask(
                     mask,
-                    closing_radius_um=2,
+                    closing_radius_um=0.05,
                     keep_largest_only=True,
                     fill_holes=True,
                     smooth_iterations=0,
                     voxel_size_um=voxel_size
             )
+
+            # Check how much volume closing added relative to original.
+            # A high fraction means the radius is doing more than gap-bridging.
+            closing_fraction = stats['closing_voxels_added'] / max(original_voxels, 1)
+            if closing_fraction > CLOSING_FRACTION_WARN:
+                msg = (
+                    f"Closing added {closing_fraction*100:.1f}% of original volume "
+                    f"({stats['closing_voxels_added']:,} vox). "
+                    f"Closing radius may be too large or segment has large surface gaps. "
+                    f"Run: diag_cleaning_param_sweep.py --segment {info.seg_id} --z-slab 20 --no-obj"
+                )
+                log_warning_box(logger, "CLEANING", name, msg)
+                warnings.append(WarningRecord(name, "cleaning", msg, "medium"))
+                review_queue_entries.append({
+                    'segment_name':         name,
+                    'segment_id':           info.seg_id,
+                    'role':                 info.role,
+                    'reason':               'high_closing_fraction',
+                    'closing_radius_um':    0.05,
+                    'original_voxels':      original_voxels,
+                    'closing_voxels_added': stats['closing_voxels_added'],
+                    'closing_fraction':     round(closing_fraction, 4),
+                    'components_after_clean': stats['original_components'],
+                    'recommended_action':   (
+                        f"diag_cleaning_param_sweep.py --segment {info.seg_id} "
+                        f"--z-slab 20 --no-obj"
+                    ),
+                })
 
             if stats['original_components'] > 1:
                 logger.warning(
@@ -252,7 +336,7 @@ def run_phase1(
                 # Re-clean keeping only the largest component
                 cleaned, stats = cleaner.clean_mask(
                     cleaned.mask,
-                    closing_radius_um=2,
+                    closing_radius_um=0.05,
                     keep_largest_only=True,
                     fill_holes=False,
                     smooth_iterations=0,
@@ -285,6 +369,25 @@ def run_phase1(
                                 f"{n_comp} connected components found, kept largest")
                 warnings.append(WarningRecord(name, "cleaning",
                                               f"{n_comp} components", "low"))
+                # Only add to review queue if not already flagged for high closing fraction
+                if not any(e['segment_name'] == name for e in review_queue_entries):
+                    review_queue_entries.append({
+                        'segment_name':         name,
+                        'segment_id':           info.seg_id,
+                        'role':                 info.role,
+                        'reason':               'residual_fragmentation',
+                        'closing_radius_um':    0.05,
+                        'original_voxels':      original_voxels,
+                        'closing_voxels_added': stats['closing_voxels_added'],
+                        'closing_fraction':     round(
+                            stats['closing_voxels_added'] / max(original_voxels, 1), 4
+                        ),
+                        'components_after_clean': n_comp,
+                        'recommended_action':   (
+                            f"diag_cleaning_param_sweep.py --segment {info.seg_id} "
+                            f"--z-slab 20 --no-obj"
+                        ),
+                    })
 
             # 1C. Skeletonize voxels (includes compression, pruning, soma insertion)
             tree, skel_stats = skel.extract_skeleton(
@@ -338,8 +441,10 @@ def run_phase1(
             continue
 
     log_phase_summary(logger, "Phase 1", len(targets), len(results), failures, warnings)
+    _write_review_queue(review_queue_entries, output_dir, logger)
     return results, failures, warnings
 
+#  Phase 2
 
 def run_phase2(
     registry: SegmentRegistry,
@@ -392,7 +497,6 @@ def run_phase2(
             logger.info(f"  {role}: {len(entries)} entries ({method_str})")
 
     return table
-
 
 #  Phase 3
 
@@ -451,7 +555,6 @@ def run_phase3(
 
     return mapping_table
 
-
 #  Phase 4
 
 def run_phase4(
@@ -502,8 +605,8 @@ def run_phase4(
     )
     return connectivity
 
-# Main entry point
 
+# Main entry point
 def main():
     output_dir = "./vast_export"
 
@@ -534,7 +637,7 @@ def main():
         vast=classifier.vast,
         logger=logger,
         output_dir=output_dir,
-        miplevel=0,  # MIP 0 for small markers -- MIP 1 may reduce to too few voxels
+        miplevel=1,  # MIP 0 for small markers -- MIP 1 may reduce to too few voxels
     )
 
     # Phase 3 boundary check

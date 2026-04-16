@@ -198,6 +198,21 @@ class VoxelCleaner:
     2. Component filtering    — discard small specks / keep largest.
     3. Hole filling           — seal now-enclosed interior voids.
     4. Smoothing              — optional surface regularisation.
+
+    Recommended parameters for barn owl auditory cortex data
+    ---------------------------------------------------------
+    Gap source: incomplete boundary mask + fill workflow produces surface
+    discontinuities of 0.6-1.1 µm (occasionally up to ~2 µm).
+    Internal dark structures (mitochondria, vesicles) are not biology to
+    preserve — the entire neuron interior should be solid.
+
+    Recommended settings:
+      closing_radius_um = 0.05   # bridges typical 0.6-1.1 µm gaps
+      keep_largest_only = True
+      fill_holes        = True
+
+    Run diag_cleaning_param_sweep.py to validate the chosen radius against
+    your specific segment types before committing to a value.
     """
 
     def __init__(self, logger: Optional[logging.Logger] = None):
@@ -206,15 +221,15 @@ class VoxelCleaner:
     def clean_mask(
         self,
         mask: np.ndarray,
+        voxel_size_um: Tuple[float, float, float], # For biological reasoning, different mips different voxel sizes, so this is required to choose an appropriate closing structuring element size
         bbox_min_vox: Tuple[int, int, int] = (0, 0, 0),
         min_component_voxels: int = 5000,
         keep_largest_only: bool = True,
         fill_holes: bool = True,
         fill_holes_per_axis: bool = False,
         smooth_iterations: int = 0,
-        closing_radius_um: float = 1.0,
+        closing_radius_um: float = 0.05, # Micrometers
         closing_iterations: int = 1,
-        voxel_size_um: Optional[Tuple[float, float, float]] = None,
     ) -> Tuple[VoxelData, Dict[str, Any]]:
         """
         Clean a binary voxel mask.
@@ -239,10 +254,15 @@ class VoxelCleaner:
                                    sparse or C-shaped structures.
             smooth_iterations    : Morphological open/close smoothing passes
                                    (0 = disabled).
-            closing_radius_um    : XY-voxel radius for the morphological closing
-                                   step that bridges annotation gaps (0 = skip).
-                                   Increase for larger surface discontinuities
-                                   (e.g. 3–5 for coarse EM segmentations).
+            closing_radius_um    : Physical radius for the morphological closing
+                                   step in micrometers (0 = skip closing).
+                                   Bridges surface discontinuities smaller than
+                                   this radius.  Recommended starting point for
+                                   barn owl auditory cortex data: 0.05 µm, which
+                                   covers the typical gap range of 0.6-1.1 µm
+                                   from incomplete boundary mask fills.  Increase
+                                   to ~1.5 µm for the occasional ~2 µm gap.
+                                   Use diag_cleaning_param_sweep.py to tune.
             closing_iterations   : Number of closing passes to apply.  A single
                                    pass bridges gaps up to ~radius_um.  Multiple
                                    passes with the same element progressively
@@ -262,7 +282,7 @@ class VoxelCleaner:
         -------------------------------------
         Internal gaps (voids inside the neuron body):
           • Increase closing_radius_um so the shell gaps get bridged before
-            hole filling (start at 2–4 XY voxels).
+            hole filling (start at 2-4 XY voxels).
           • Enable fill_holes_per_axis=True to catch elongated open voids that
             the 3D filler misses.
           • Use closing_iterations=2 or 3 if a single pass is insufficient.
@@ -314,9 +334,19 @@ class VoxelCleaner:
         # ------------------------------------------------------------------
         cleaned_mask = mask.astype(bool)
 
+        # Convert um to voxels
+        sx, sy, sz = voxel_size_um
+        avg_voxel_um = (sx + sy) / 2.0
+        closing_radius_vox = max(1, int(np.round(closing_radius_um / avg_voxel_um)))
+
+        self.logger.info(
+            f"[clean_mask] Closing radius: {closing_radius_um:.2f} µm "
+            f"(~{closing_radius_vox} voxels at {avg_voxel_um*1000:.1f} nm/voxel)"
+        )
+
         if closing_radius_um > 0 and closing_iterations > 0:
             struct = _make_anisotropic_structuring_element(
-                closing_radius_um, voxel_size_um
+                closing_radius_vox, voxel_size_um
             )
             self.logger.info(
                 f"[clean_masks] Morphological closing "
