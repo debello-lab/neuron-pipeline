@@ -12,10 +12,12 @@ Pipeline phases:
   Phase 3  Map centroids to SWC cable locations
   Phase 4  Connectivity CSV + Arbor recipe generation
 """
+import argparse
+import csv
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Collection, Dict, List, Optional, Tuple
 
 
 import logging
@@ -71,8 +73,14 @@ class WarningRecord:
 # Logger setup
 # ---------------------------------------------------------------------------
 
-def setup_pipeline_logger(output_dir: str) -> logging.Logger:
-    """Create a single logger writing to both console and pipeline_TIMESTAMP.log."""
+def setup_pipeline_logger(
+    output_dir: str,
+    console_level: int = logging.INFO,
+) -> logging.Logger:
+    """Create a single logger writing to both console and pipeline_TIMESTAMP.log.
+
+    The file handler is always at DEBUG; console_level controls the terminal output.
+    """
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = Path(output_dir) / "logs" / f"pipeline_{ts}.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -90,7 +98,7 @@ def setup_pipeline_logger(output_dir: str) -> logging.Logger:
     fh.setFormatter(fmt)
 
     ch = logging.StreamHandler()
-    ch.setLevel(logging.INFO)
+    ch.setLevel(console_level)
     ch.setFormatter(fmt)
 
     logger.addHandler(fh)
@@ -220,7 +228,9 @@ def run_phase1(
     miplevel: int = 1,
     padding: int = 1,
     spur_length_um: float = 2.0,
-) -> Tuple[Dict[str, Tuple[nx.DiGraph, str]], List[FailureRecord], List[WarningRecord]]:
+    skip_existing: bool = False,
+    only_segments: Optional[Collection[str]] = None,
+) -> Tuple[Dict[str, Tuple[Optional[nx.DiGraph], str]], List[FailureRecord], List[WarningRecord]]:
     """
     Phase 1: Extract and skeletonize every AXON and POST_SYN segment.
     After extraction but before skeletonization, the segments will be cleaned to remove small disconnected components and fill holes. The resulting skeletons are pruned to remove short spurs, and the final SWC files are written to disk.
@@ -250,10 +260,11 @@ def run_phase1(
         (name, info)
         for name, info in registry.segments.items()
         if info.role in ('AXON', 'POST_SYN')
+        and (only_segments is None or name in only_segments)
     ]
     logger.info(f"Phase 1: {len(targets)} segments to skeletonize (AXON + POST_SYN)")
 
-    results: Dict[str, Tuple[nx.DiGraph, str]] = {}
+    results: Dict[str, Tuple[Optional[nx.DiGraph], str]] = {}
     failures: List[FailureRecord] = []
     warnings: List[WarningRecord] = []
     review_queue_entries: List[dict] = []
@@ -265,6 +276,12 @@ def run_phase1(
 
     for name, info in targets:
         logger.info(f"--- {info.role} {name} (seg {info.seg_id}) ---")
+
+        if skip_existing and (swc_dir / f"cell_{name}.swc").exists():
+            logger.info(f"  {name}: skipping (--resume, SWC already exists)")
+            # Store a None-graph placeholder; _backfill_skipped_trees() will load it later.
+            results[name] = (None, str(swc_dir / f"cell_{name}.swc"))
+            continue
 
         try:
             # 1A. Voxel extraction
@@ -296,7 +313,8 @@ def run_phase1(
                     keep_largest_only=True,
                     fill_holes=True,
                     smooth_iterations=0,
-                    voxel_size_um=voxel_size
+                    voxel_size_um=voxel_size,
+                    bbox_min_vox=bbox_min,
             )
 
             # Check how much volume closing added relative to original.
@@ -340,7 +358,8 @@ def run_phase1(
                     keep_largest_only=True,
                     fill_holes=False,
                     smooth_iterations=0,
-                    voxel_size_um=voxel_size
+                    voxel_size_um=voxel_size,
+                    bbox_min_vox=bbox_min,
                 )
 
             # Validate cleaning did not discard too much
@@ -393,7 +412,7 @@ def run_phase1(
             tree, skel_stats = skel.extract_skeleton(
                 mask=cleaned.mask,
                 voxel_size_um=voxel_size,
-                bbox_min_vox=cleaned.bbox_min_vox,
+                bbox_min_vox=bbox_min,
                 spur_length_um=spur_length_um,
             )
 
@@ -425,6 +444,8 @@ def run_phase1(
                     'voxel_size_um': str(voxel_size),   # (sx, sy, sz) in µm
                     'coord_frame': COORD_FRAME_PHYSICAL,
                     'compressed_nodes': skel_stats.get('compressed_nodes'),
+                    'bouton_clusters_collapsed': skel_stats.get('bouton_clusters_collapsed', 0),
+                    'bouton_nodes_removed': skel_stats.get('bouton_nodes_removed', 0),
                     'spurs_pruned': skel_stats.get('branches_pruned'),
                     'total_length_um': f"{skel_stats.get('total_length_um', 0):.2f}",
                 },
@@ -452,6 +473,7 @@ def run_phase2(
     logger: logging.Logger,
     output_dir: str = "./vast_export",
     miplevel: int = 0,
+    only_segments: Optional[Collection[str]] = None,
 ) -> CentroidTable:
     """
     Phase 2: Extract centroid positions for all BOUTON, SYNAPSE, and CONTACT
@@ -478,7 +500,8 @@ def run_phase2(
 
     table = centroid_extractor.extract_centroids(
         registry=registry,
-        miplevel=miplevel
+        miplevel=miplevel,
+        only_names=only_segments,
     )
 
     csv_path = str(Path(output_dir) / "centroids.csv")
@@ -603,94 +626,408 @@ def run_phase4(
         f"Phase 4 complete: {len(synapses)} synapses, {len(contacts)} contacts  "
         f"-> {csv_path}  {recipe_path}"
     )
+
+    summary_path, report_path = builder.write_analysis(
+        connectivity=connectivity,
+        registry=registry,
+        trees=trees,
+        output_dir=output_dir,
+    )
+    logger.info(f"Connectivity analysis -> {summary_path}  {report_path}")
+
     return connectivity
 
 
+# ---------------------------------------------------------------------------
+# CLI argument parsing
+# ---------------------------------------------------------------------------
+
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="neuron-pipeline",
+        description="Neuron reconstruction pipeline (phases 0-4)",
+    )
+
+    # Phase control — mutually exclusive
+    phase_group = p.add_mutually_exclusive_group()
+    phase_group.add_argument(
+        "--phases", nargs="+", type=int, metavar="N",
+        choices=range(5),
+        help="Run only the listed phase numbers (0-4). Default: all phases.",
+    )
+    phase_group.add_argument(
+        "--from-phase", type=int, metavar="N",
+        choices=range(1, 5),
+        help=(
+            "Run from phase N through 4, loading earlier outputs from disk. "
+            "Phase 0 (classification) always re-runs."
+        ),
+    )
+
+    # Output / I/O
+    p.add_argument(
+        "--output-dir", default="./vast_export", metavar="DIR",
+        help="Base output directory (default: ./vast_export).",
+    )
+    p.add_argument(
+        "--resume", action="store_true",
+        help="Phase 1: skip segments that already have a .swc file on disk.",
+    )
+
+    # Phase 1 parameters
+    p.add_argument(
+        "--miplevel-skel", type=int, default=1, metavar="N",
+        help="MIP level for Phase 1 voxel extraction (default: 1).",
+    )
+    p.add_argument(
+        "--spur-length-um", type=float, default=2.0, metavar="F",
+        help="Phase 1 spur-pruning threshold in µm (default: 2.0).",
+    )
+
+    # Phase 2 parameters
+    p.add_argument(
+        "--miplevel-centroid", type=int, default=1, metavar="N",
+        help="MIP level for Phase 2 centroid extraction (default: 1).",
+    )
+
+    # Phase 3 parameters
+    p.add_argument(
+        "--warn-distance-um", type=float, default=5.0, metavar="F",
+        help="Phase 3 mapping distance warning threshold in µm (default: 5.0).",
+    )
+
+    # Phase 4 parameters
+    p.add_argument(
+        "--syn-mechanism", default="expsyn", metavar="NAME",
+        help="Arbor synapse mechanism name for Phase 4 (default: expsyn).",
+    )
+
+    # Segment filter
+    p.add_argument(
+        "--segment", "--segments", nargs="+", metavar="NAME", dest="segments",
+        help="Process only the named segments, e.g. --segment A1 A1B2P1.",
+    )
+
+    # Logging
+    p.add_argument(
+        "--log-level", default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Console log verbosity (default: INFO). File log is always DEBUG.",
+    )
+
+    return p.parse_args()
+
+
+def _resolve_active_phases(args: argparse.Namespace) -> frozenset:
+    """Return the set of phase numbers to execute.
+
+    Phase 0 (classification) is always included because downstream phases
+    need the SegmentRegistry it produces.
+    """
+    if args.from_phase is not None:
+        return frozenset({0} | set(range(args.from_phase, 5)))
+    if args.phases is not None:
+        return frozenset({0} | set(args.phases))
+    return frozenset(range(5))
+
+
+# ---------------------------------------------------------------------------
+# Disk loaders used by --from-phase and --resume
+# ---------------------------------------------------------------------------
+
+def _load_single_swc(swc_path: str) -> nx.DiGraph:
+    """Reconstruct an nx.DiGraph from a single SWC file.
+
+    Each SWC row becomes a graph node keyed by the integer SWC id.
+    Node attributes: pos=(x,y,z) in µm, radius, swc_id, degree.
+    Edge attributes: length (Euclidean distance between endpoints).
+    Edges run parent → child (root-outward), matching Phase 1 convention.
+    """
+    node_pos: Dict[int, tuple] = {}
+    node_radius: Dict[int, float] = {}
+    parent_map: Dict[int, int] = {}  # child_id -> parent_id (-1 = root)
+
+    with open(swc_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = line.split()
+            nid = int(parts[0])
+            x, y, z = float(parts[2]), float(parts[3]), float(parts[4])
+            r = float(parts[5])
+            pid = int(parts[6])
+            node_pos[nid] = (x, y, z)
+            node_radius[nid] = r
+            parent_map[nid] = pid
+
+    G: nx.DiGraph = nx.DiGraph()
+    for nid, pos in node_pos.items():
+        G.add_node(nid, pos=pos, radius=node_radius[nid], swc_id=nid)
+
+    for child_id, parent_id in parent_map.items():
+        if parent_id == -1:
+            continue
+        pu = np.array(node_pos[parent_id])
+        pv = np.array(node_pos[child_id])
+        G.add_edge(parent_id, child_id, length=float(np.linalg.norm(pu - pv)))
+
+    for n in G.nodes():
+        G.nodes[n]['degree'] = G.degree(n)
+
+    return G
+
+
+def _load_trees_from_disk(
+    swc_dir: Path,
+    logger: logging.Logger,
+) -> Dict[str, Tuple[nx.DiGraph, str]]:
+    """Load all cell_*.swc files from swc_dir and return a trees dict.
+
+    Used when --from-phase skips Phase 1 entirely.
+    """
+    trees: Dict[str, Tuple[nx.DiGraph, str]] = {}
+    swc_files = sorted(swc_dir.glob("cell_*.swc"))
+    if not swc_files:
+        logger.warning(f"_load_trees_from_disk: no cell_*.swc files found in {swc_dir}")
+        return trees
+
+    for path in swc_files:
+        # Filename convention: cell_{segment_name}.swc
+        name = path.stem[len("cell_"):]
+        try:
+            G = _load_single_swc(str(path))
+            trees[name] = (G, str(path))
+        except Exception as e:
+            logger.warning(f"  Could not load SWC for {name}: {e}")
+
+    logger.info(f"Loaded {len(trees)} trees from {swc_dir}")
+    return trees
+
+
+def _backfill_skipped_trees(
+    trees: Dict[str, Tuple[Optional[nx.DiGraph], str]],
+    logger: logging.Logger,
+) -> None:
+    """Replace None-graph placeholders left by --resume with graphs loaded from disk.
+
+    Modifies trees in-place. Entries whose SWC file is missing are removed.
+    """
+    to_remove: List[str] = []
+    for name, (graph, swc_path) in trees.items():
+        if graph is not None:
+            continue
+        if not Path(swc_path).exists():
+            logger.warning(f"  --resume: SWC missing for {name} ({swc_path}), dropping from trees")
+            to_remove.append(name)
+            continue
+        try:
+            trees[name] = (_load_single_swc(swc_path), swc_path)
+        except Exception as e:
+            logger.warning(f"  --resume: failed to load SWC for {name}: {e}, dropping")
+            to_remove.append(name)
+    for name in to_remove:
+        del trees[name]
+
+
+def _load_centroids_from_csv(
+    csv_path: str,
+    logger: logging.Logger,
+) -> CentroidTable:
+    """Reconstruct a CentroidTable from centroids.csv written by Phase 2."""
+    from neuron_pipeline.stages.centroid_extraction import CentroidEntry
+    table = CentroidTable()
+    with open(csv_path, newline='') as f:
+        for row in csv.DictReader(f):
+            table.add(CentroidEntry(
+                name=row['name'],
+                seg_id=int(row['seg_id']),
+                role=row['role'],
+                cx_um=float(row['cx_um']),
+                cy_um=float(row['cy_um']),
+                cz_um=float(row['cz_um']),
+                method=row['method'],
+                coord_frame=row.get('coord_frame', 'physical_um_xyz_center'),
+            ))
+    logger.info(f"Loaded {len(table)} centroids from {csv_path}")
+    return table
+
+
+def _load_mappings_from_csv(
+    csv_path: str,
+    logger: logging.Logger,
+) -> CableMappingTable:
+    """Reconstruct a CableMappingTable from cable_mappings.csv written by Phase 3."""
+    from neuron_pipeline.stages.centroid_mapper import CableMappingEntry
+    table = CableMappingTable()
+
+    def _opt_int(v: str) -> Optional[int]:
+        return None if v == '' else int(v)
+
+    with open(csv_path, newline='') as f:
+        for row in csv.DictReader(f):
+            table.add(CableMappingEntry(
+                centroid_name=row['centroid_name'],
+                centroid_role=row['centroid_role'],
+                cx_um=float(row['cx_um']),
+                cy_um=float(row['cy_um']),
+                cz_um=float(row['cz_um']),
+                cell_name=row['cell_name'],
+                cell_role=row['cell_role'],
+                edge_u=int(row['edge_u']),
+                edge_v=int(row['edge_v']),
+                arc_fraction=float(row['arc_fraction']),
+                nearest_x_um=float(row['nearest_x_um']),
+                nearest_y_um=float(row['nearest_y_um']),
+                nearest_z_um=float(row['nearest_z_um']),
+                distance_um=float(row['distance_um']),
+                coord_frame=row.get('coord_frame', 'physical_um_xyz_center'),
+                qc_distance_flag=row.get('qc_distance_flag', 'ok'),
+                swc_node_u=_opt_int(row.get('swc_node_u', '')),
+                swc_node_v=_opt_int(row.get('swc_node_v', '')),
+            ))
+    logger.info(f"Loaded {len(table)} cable mappings from {csv_path}")
+    return table
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
+# ---------------------------------------------------------------------------
+
 def main():
-    output_dir = "./vast_export"
+    args = _parse_args()
+    output_dir = args.output_dir
+    active = _resolve_active_phases(args)
+    only_segments: Optional[set] = set(args.segments) if args.segments else None
+    console_level = getattr(logging, args.log_level)
 
-    logger = setup_pipeline_logger(output_dir)
-    logger.info("Pipeline starting")
+    logger = setup_pipeline_logger(output_dir, console_level=console_level)
+    logger.info(
+        f"Pipeline starting  phases={sorted(active)}  output={output_dir}"
+        + (f"  segments={sorted(only_segments)}" if only_segments else "")
+    )
 
-    # Phase 0: Classify segments
+    # Phase 0: always run — downstream phases need the SegmentRegistry
     classifier = SegmentClassifier()
     registry = classifier.classify_segments()
 
     if not registry.segments:
-        logger.error("Phase 1 aborted: registry is empty after classification")
+        logger.error("Phase 0: registry is empty — aborting")
         return
 
-    # Phase 1: Skeletonize AXON and POST_SYN
-    trees, p1_failures, p1_warnings = run_phase1(
-        registry=registry,
-        vast=classifier.vast,
-        logger=logger,
-        output_dir=output_dir,
-        miplevel=1,
-        spur_length_um=2.0,
-    )
+    # ------------------------------------------------------------------
+    # Phase 1
+    # ------------------------------------------------------------------
+    # raw_trees may contain None-graph placeholders when --resume is used.
+    raw_trees: Dict[str, Tuple[Optional[nx.DiGraph], str]]
 
-    # Phase 2: extract BOUTON / SYNAPSE / CONTACT centroids
-    centroids = run_phase2(
-        registry=registry,
-        vast=classifier.vast,
-        logger=logger,
-        output_dir=output_dir,
-        miplevel=1,  # MIP 0 for small markers -- MIP 1 may reduce to too few voxels
-    )
+    if 1 in active:
+        raw_trees, _, _ = run_phase1(
+            registry=registry,
+            vast=classifier.vast,
+            logger=logger,
+            output_dir=output_dir,
+            miplevel=args.miplevel_skel,
+            spur_length_um=args.spur_length_um,
+            skip_existing=args.resume,
+            only_segments=only_segments,
+        )
+        # Fill in any None placeholders left by --resume
+        _backfill_skipped_trees(raw_trees, logger)
+    else:
+        swc_dir = Path(output_dir) / "swc"
+        raw_trees = _load_trees_from_disk(swc_dir, logger)  # type: ignore[assignment]
 
-    # Phase 3 boundary check
-    if not centroids.entries:
-        logger.error("Phase 3 aborted: centroid table is empty")
-        return
-    if not trees:
-        logger.error("Phase 3 aborted: no trees produced by Phase 1 (all segments failed)")
-        return
+    # Narrow to entries where the graph is confirmed loaded (drops failures/missing SWCs)
+    trees: Dict[str, Tuple[nx.DiGraph, str]] = {
+        name: (g, p)
+        for name, (g, p) in raw_trees.items()
+        if g is not None
+    }
 
-    # Warn about centroids whose parent axon failed Phase 1 (expected for bad segmentation)
-    missing_parents = set()
-    for entry in centroids.entries:
-        m = re.match(r'^(A\d+)', entry.name)
-        if m:
-            axon_name = m.group(1)
-            if axon_name not in trees:
-                missing_parents.add(axon_name)
-    if missing_parents:
-        logger.warning(
-            f"Phase 3: {len(missing_parents)} parent axon(s) absent from Phase 1 output "
-            f"— centroids referencing them will be skipped: {sorted(missing_parents)}"
+    # ------------------------------------------------------------------
+    # Phase 2
+    # ------------------------------------------------------------------
+    centroids: CentroidTable
+
+    if 2 in active:
+        centroids = run_phase2(
+            registry=registry,
+            vast=classifier.vast,
+            logger=logger,
+            output_dir=output_dir,
+            miplevel=args.miplevel_centroid,
+            only_segments=only_segments,
+        )
+    elif 3 in active or 4 in active:
+        csv_path = str(Path(output_dir) / "centroids.csv")
+        centroids = _load_centroids_from_csv(csv_path, logger)
+    else:
+        centroids = CentroidTable()
+
+    # ------------------------------------------------------------------
+    # Phase 3
+    # ------------------------------------------------------------------
+    mappings: CableMappingTable
+
+    if 3 in active:
+        if not centroids.entries:
+            logger.error("Phase 3 aborted: centroid table is empty")
+            return
+        if not trees:
+            logger.error("Phase 3 aborted: no trees available (Phase 1 output missing or all failed)")
+            return
+
+        # Warn about centroids whose parent axon tree is absent
+        missing_parents = set()
+        for entry in centroids.entries:
+            m = re.match(r'^(A\d+)', entry.name)
+            if m:
+                axon_name = m.group(1)
+                if axon_name not in trees:
+                    missing_parents.add(axon_name)
+        if missing_parents:
+            logger.warning(
+                f"Phase 3: {len(missing_parents)} parent axon(s) absent from trees "
+                f"— their centroids will be skipped: {sorted(missing_parents)}"
+            )
+
+        mappings = run_phase3(
+            centroid_table=centroids,
+            trees=trees,
+            registry=registry,
+            logger=logger,
+            output_dir=output_dir,
+            warn_distance_um=args.warn_distance_um,
+        )
+    elif 4 in active:
+        csv_path = str(Path(output_dir) / "cable_mappings.csv")
+        mappings = _load_mappings_from_csv(csv_path, logger)
+    else:
+        mappings = CableMappingTable()
+
+    # ------------------------------------------------------------------
+    # Phase 4
+    # ------------------------------------------------------------------
+    if 4 in active:
+        if not mappings.entries:
+            logger.warning("Phase 4: mapping table is empty — connectivity output will be empty")
+
+        connectivity = run_phase4(
+            registry=registry,
+            trees=trees,
+            mapping_table=mappings,
+            logger=logger,
+            output_dir=output_dir,
+            syn_mechanism=args.syn_mechanism,
         )
 
-    # Phase 3: Map centroids onto skeleton cable
-    mappings = run_phase3(
-        centroid_table=centroids,
-        trees=trees,
-        registry=registry,
-        logger=logger,
-        output_dir=output_dir,
-        warn_distance_um=5.0,
-    )
-
-    # Phase 4 boundary check
-    if not mappings.entries:
-        logger.warning("Phase 4: mapping table is empty — connectivity output will be empty")
-
-    connectivity = run_phase4(
-        registry=registry,
-        trees=trees,
-        mapping_table=mappings,
-        logger=logger,
-        output_dir=output_dir,
-        syn_mechanism="expsyn",
-    )
-
-    logger.info(
-        f"Pipeline complete. "
-        f"Outputs in {output_dir}/  "
-        f"({len(trees)} SWC files, "
-        f"{len(connectivity)} connectivity rows)"
-    )
+        logger.info(
+            f"Pipeline complete. "
+            f"Outputs in {output_dir}/  "
+            f"({len(trees)} SWC files, "
+            f"{len(connectivity)} connectivity rows)"
+        )
 
 
 if __name__ == "__main__":

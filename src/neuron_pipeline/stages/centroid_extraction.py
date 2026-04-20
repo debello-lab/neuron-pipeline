@@ -31,7 +31,7 @@ import logging
 import numpy as np
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Collection, Dict, List, Optional, Tuple
 
 from neuron_pipeline.stages.extract_surfaces import SegmentSurfaceExtractor
 from neuron_pipeline.stages.segment_classifier import SegmentRegistry, SegmentInfo
@@ -130,15 +130,17 @@ class CentroidExtractor:
         miplevel: int = DEFAULT_MIPLEVEL,
         padding: int = DEFAULT_PADDING,
         roles: Tuple[str, ...] = _TARGET_ROLES,
+        only_names: Optional[Collection[str]] = None,
     ) -> CentroidTable:
         """
         Compute centroids for all segments whose role is in *roles*.
 
         Args:
-            registry  : SegmentRegistry built by Phase 0.
-            miplevel  : MIP level for voxel extraction (0 = full resolution).
-            padding   : Padding voxels added around the bounding box.
-            roles     : Tuple of role strings to process.
+            registry   : SegmentRegistry built by Phase 0.
+            miplevel   : MIP level for voxel extraction (0 = full resolution).
+            padding    : Padding voxels added around the bounding box.
+            roles      : Tuple of role strings to process.
+            only_names : If given, restrict to segments whose name is in this collection.
 
         Returns:
             CentroidTable with one entry per processed segment.
@@ -147,6 +149,7 @@ class CentroidExtractor:
             info
             for info in registry.segments.values()
             if info.role in roles
+            and (only_names is None or info.name in only_names)
         ]
 
         role_counts = {}
