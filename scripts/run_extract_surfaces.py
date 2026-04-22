@@ -69,7 +69,7 @@ def main():
                 extract_surface(extractor, segment_id)
 
         else:
-            # No arguments — extract all segments
+            # No arguments -- extract all segments
             num_segments = vast.get_number_of_segments()
             if num_segments is None:
                 print("ERROR: Could not retrieve number of segments")

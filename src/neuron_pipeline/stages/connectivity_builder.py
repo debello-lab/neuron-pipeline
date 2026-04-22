@@ -61,7 +61,7 @@ class SynapseRow:
     pre_nearest_z_um: float
     distance_pre_um: float
 
-    # Postsynaptic side (POST_SYN cell) — empty string / -1 for contacts
+    # Postsynaptic side (POST_SYN cell) -- empty string / -1 for contacts
     post_cell: str
     post_swc: str
     post_edge_u: int
@@ -168,8 +168,8 @@ class ConnectivityBuilder:
 
         Args:
             registry      : SegmentRegistry from Phase 0.
-            trees         : Phase 1 output — cell_name -> (tree, swc_path).
-            mapping_table : Phase 3 output — CableMappingTable.
+            trees         : Phase 1 output -- cell_name -> (tree, swc_path).
+            mapping_table : Phase 3 output -- CableMappingTable.
             output_dir    : Base directory; files written here.
             syn_mechanism : Arbor mechanism name for confirmed synapses.
 
@@ -250,7 +250,7 @@ class ConnectivityBuilder:
         if bouton_map is None:
             self.logger.debug(
                 f"  SYNAPSE {conn_row.synapse_name}: no cable mapping for "
-                f"BOUTON {conn_row.bouton_name} — skipped"
+                f"BOUTON {conn_row.bouton_name} -- skipped"
             )
             return None
 
@@ -327,7 +327,7 @@ class ConnectivityBuilder:
         if bouton_map is None:
             self.logger.debug(
                 f"  CONTACT {contact_row.contact_name}: no cable mapping for "
-                f"BOUTON {contact_row.bouton_name} — skipped"
+                f"BOUTON {contact_row.bouton_name} -- skipped"
             )
             return None
 
@@ -474,7 +474,7 @@ class ConnectivityBuilder:
         """
         Write connectivity_summary.csv and connectivity_report.txt.
 
-        Summary CSV: one row per (axon, post_syn) pair — synapse counts,
+        Summary CSV: one row per (axon, post_syn) pair -- synapse counts,
         distance stats, and QC flag tallies.
 
         Report: plain-text with segment inventory, per-pair breakdown,

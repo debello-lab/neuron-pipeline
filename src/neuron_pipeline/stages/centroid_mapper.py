@@ -364,7 +364,7 @@ class CentroidMapper:
             )
             return 'no_tree'
 
-        # Both centroid and skeleton are in physical_um_xyz — validated by
+        # Both centroid and skeleton are in physical_um_xyz -- validated by
         # _assert_frame_consistency() before this method is called.
         point = np.array([entry.cx_um, entry.cy_um, entry.cz_um], dtype=np.float64)
         result = idx.query(point)

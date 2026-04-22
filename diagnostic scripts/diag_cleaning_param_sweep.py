@@ -6,9 +6,9 @@ metrics for each, helping identify the smallest radius that reliably bridges
 annotation gaps without over-smoothing morphology.
 
 Two test modes run in sequence:
-  1. Synthetic  — a pure-NumPy cylinder with planted voids of known sizes.
+  1. Synthetic  -- a pure-NumPy cylinder with planted voids of known sizes.
                   Validates that each radius closes the gap sizes it should.
-  2. Real       — a segment extracted from VAST (if --segment is provided).
+  2. Real       -- a segment extracted from VAST (if --segment is provided).
                   Tests on actual data to confirm the chosen radius works.
 
 Gap sizes planted in the synthetic segment:
@@ -18,8 +18,8 @@ Gap sizes planted in the synthetic segment:
 
 Outputs
 -------
-  sweep_results/<label>_sweep.csv            — metric table per radius
-  sweep_results/<label>_radius_<r>_final.obj — cleaned mesh at each radius
+  sweep_results/<label>_sweep.csv            -- metric table per radius
+  sweep_results/<label>_radius_<r>_final.obj -- cleaned mesh at each radius
 
 Usage
 -----
@@ -86,7 +86,7 @@ def make_cylinder_with_gaps(
 
     Parameters
     ----------
-    voxel_size_um : (sx, sy, sz) — used only for logging
+    voxel_size_um : (sx, sy, sz) -- used only for logging
     radius_vox    : cylinder radius in voxels
     length_vox    : cylinder length along Z in voxels
     seed          : random seed for void placement
@@ -139,7 +139,7 @@ def make_cylinder_with_gaps(
         f"filled voxels: {voxel_count:,}"
     )
     log.info(
-        f"[synthetic] Planted voids — "
+        f"[synthetic] Planted voids -- "
         f"3x small (~{5*sx*1000:.0f} nm), "
         f"3x medium (~{10*sx*1000:.0f} nm), "
         f"2x large (~{15*sx*1000:.0f} nm)"
@@ -201,7 +201,7 @@ def mask_to_obj(
     filepath: Path,
 ) -> None:
     if not mask.any():
-        log.warning(f"  Mask is empty — skipping {filepath.name}")
+        log.warning(f"  Mask is empty -- skipping {filepath.name}")
         return
 
     verts, faces, _, _ = marching_cubes(mask, level=0.5)
@@ -213,7 +213,7 @@ def mask_to_obj(
 
     filepath.parent.mkdir(parents=True, exist_ok=True)
     with open(filepath, "w") as f:
-        f.write(f"# param sweep — {filepath.stem}\n")
+        f.write(f"# param sweep -- {filepath.stem}\n")
         for v in verts_um:
             f.write(f"v {v[0]:.4f} {v[1]:.4f} {v[2]:.4f}\n")
         for face in faces:
@@ -384,7 +384,7 @@ def parse_args() -> argparse.Namespace:
                    help="Comma-separated closing radii in µm "
                         f"(default: {','.join(str(r) for r in DEFAULT_RADII_UM)})")
     p.add_argument("--no-obj",  action="store_true", default=False,
-                   help="Skip OBJ mesh export (faster — CSV metrics only)")
+                   help="Skip OBJ mesh export (faster -- CSV metrics only)")
     p.add_argument("--z-slab",  type=int, default=None, metavar="N",
                    help="Crop the real segment to N Z-slices around the centre "
                         "before sweeping. Recommended for large masks where the "
@@ -461,7 +461,7 @@ def main() -> None:
         )
 
         if mask is None or voxel_size is None or bbox_min is None:
-            log.error(f"Extraction failed for segment {args.segment} — is the ID valid?")
+            log.error(f"Extraction failed for segment {args.segment} -- is the ID valid?")
             return
 
         log.info(
@@ -475,7 +475,7 @@ def main() -> None:
         if args.z_slab is not None:
             filled_z = np.where(mask.any(axis=(1, 2)))[0]
             if len(filled_z) == 0:
-                log.error("Mask has no filled voxels — cannot crop slab.")
+                log.error("Mask has no filled voxels -- cannot crop slab.")
                 return
             z_center = int(filled_z[len(filled_z) // 2])
             half = args.z_slab // 2
@@ -488,7 +488,7 @@ def main() -> None:
                 f"Z={z_center})  filled voxels after crop: {int(mask.sum()):,}"
             )
             if not mask.any():
-                log.error("Z-slab contains no filled voxels — try a larger --z-slab.")
+                log.error("Z-slab contains no filled voxels -- try a larger --z-slab.")
                 return
 
         real_label = f"seg_{args.segment}_mip{args.mip}"

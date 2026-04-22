@@ -725,7 +725,7 @@ class SegmentSurfaceExtractor:
         # Add 1-voxel padding around the segment bounding box so marching cubes
         # sees zeros outside the neuron on faces that don't touch the dataset edge.
         # Faces that DO touch the dataset edge cannot be extended (no data exists
-        # beyond the boundary) — those faces are handled by the explicit zero-pad
+        # beyond the boundary) -- those faces are handled by the explicit zero-pad
         # below (close_surfaces=True), which only activates on clamped faces.
         minx = max(0, minx - 1)
         miny = max(0, miny - 1)
@@ -746,7 +746,7 @@ class SegmentSurfaceExtractor:
                        at_max_x or at_max_y or at_max_z)
         if close_surfaces and needs_close:
             self.logger.info(
-                "Segment touches dataset boundary — will pad boundary faces with zeros: "
+                "Segment touches dataset boundary -- will pad boundary faces with zeros: "
                 f"min=({at_min_x},{at_min_y},{at_min_z}) "
                 f"max=({at_max_x},{at_max_y},{at_max_z})"
             )
@@ -1069,7 +1069,7 @@ class SegmentSurfaceExtractor:
         mask = (seg_image == segment_id).astype(bool)
         # get_seg_image_rle_decoded returns (X, Y, Z) via Fortran-order reshape.
         # All downstream stages (distance_transform_edt sampling, skeleton_to_graph,
-        # centroid code, structuring element) expect (Z, Y, X) — transpose here once.
+        # centroid code, structuring element) expect (Z, Y, X) -- transpose here once.
         mask = mask.transpose(2, 1, 0)
 
         # Store the min bounds in voxels

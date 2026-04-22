@@ -2,7 +2,7 @@
 setlocal
 
 :: ============================================================
-:: ms-neuron-pipeline — run pipeline
+:: ms-neuron-pipeline -- run pipeline
 :: ============================================================
 :: Activates the project virtual environment and runs the
 :: full pipeline (Phases 0-4) via main_pipeline.py.
@@ -29,5 +29,4 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [INFO] Pipeline complete.
 endlocal

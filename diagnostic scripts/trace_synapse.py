@@ -100,7 +100,7 @@ def _trace_centroid(mask, bbox_min_vox, voxel_size_um):
     """Reproduce _centroid_from_voxels step-by-step, printing each stage."""
     z_idx, y_idx, x_idx = np.where(mask)
 
-    # Step 1 — local (relative to sub-volume)
+    # Step 1 -- local (relative to sub-volume)
     local_cx = x_idx.mean()
     local_cy = y_idx.mean()
     local_cz = z_idx.mean()
@@ -109,7 +109,7 @@ def _trace_centroid(mask, bbox_min_vox, voxel_size_um):
         f"x={local_cx:.3f}  y={local_cy:.3f}  z={local_cz:.3f}"
     )
 
-    # Step 2 — global (add bbox origin)
+    # Step 2 -- global (add bbox origin)
     global_cx = local_cx + bbox_min_vox[0]
     global_cy = local_cy + bbox_min_vox[1]
     global_cz = local_cz + bbox_min_vox[2]
@@ -118,7 +118,7 @@ def _trace_centroid(mask, bbox_min_vox, voxel_size_um):
         f"x={global_cx:.3f}  y={global_cy:.3f}  z={global_cz:.3f}"
     )
 
-    # Step 3 — physical µm (corner-of-voxel convention)
+    # Step 3 -- physical µm (corner-of-voxel convention)
     cx_um = global_cx * voxel_size_um[0]
     cy_um = global_cy * voxel_size_um[1]
     cz_um = global_cz * voxel_size_um[2]
@@ -167,7 +167,7 @@ def _get_or_build_skeleton(extractor, cleaner, skel_extractor, writer,
     if tree.number_of_nodes() == 0:
         raise RuntimeError(f"Empty skeleton for {seg_name}")
 
-    # Write SWC — this stamps swc_id onto every node via SWCWriter
+    # Write SWC -- this stamps swc_id onto every node via SWCWriter
     swc_dir.mkdir(parents=True, exist_ok=True)
     writer.write_swc(
         tree=tree,
@@ -241,7 +241,7 @@ def main():
     axon_name, bouton_name, post_syn_name = _derive_names(synapse_name)
 
     print(f"\nTracing synapse: {synapse_name}")
-    print(f"  Derived names — axon: {axon_name}  bouton: {bouton_name}  post-syn: {post_syn_name}")
+    print(f"  Derived names -- axon: {axon_name}  bouton: {bouton_name}  post-syn: {post_syn_name}")
 
 
     classifier = SegmentClassifier()
@@ -266,7 +266,7 @@ def main():
     # ── PRE-SYNAPTIC (BOUTON -> AXON) ─────────────────────────────────────────
     # The pipeline uses the BOUTON centroid for the axon-side cable location,
     # not the synapse centroid. The synapse sits at the cleft and can be several
-    # µm from the axon cable — that is expected biology, not a coordinate error.
+    # µm from the axon cable -- that is expected biology, not a coordinate error.
     print(f"\n{'='*60}")
     print(f"[PRE-SYNAPTIC SIDE]  bouton {bouton_name}  ->  axon {axon_name}")
     print(f"  (The pipeline maps the BOUTON centroid onto the axon cable.)")
@@ -318,10 +318,10 @@ def main():
     flags = {qc_pre, qc_post}
     if 'suspicious' in flags:
         verdict = "FAIL"
-        reason  = "one or more distances exceed warn threshold — likely coordinate mismatch or sparse skeleton"
+        reason  = "one or more distances exceed warn threshold -- likely coordinate mismatch or sparse skeleton"
     elif 'warn' in flags:
         verdict = "WARN"
-        reason  = "one or more distances in marginal range — worth inspecting"
+        reason  = "one or more distances in marginal range -- worth inspecting"
     else:
         verdict = "PASS"
         reason  = "both mappings within ok threshold"

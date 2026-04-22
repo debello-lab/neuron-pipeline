@@ -24,7 +24,7 @@ def _fill_holes_multiaxis(mask: np.ndarray) -> np.ndarray:
 
     Rationale: scipy's binary_fill_holes requires a void to be fully enclosed
     in 3D.  Elongated internal voids (e.g. a gap running along Z) may be open
-    at their ends in 3D — not enclosed — but appear as closed holes in every
+    at their ends in 3D -- not enclosed -- but appear as closed holes in every
     XY cross-section.  Filling per-slice catches these cases.
 
     This is intentionally more aggressive than a 3D-only fill.  Use the
@@ -106,7 +106,7 @@ class VoxelData:
     
     # Spatial reference (how to convert mask indices to physical space)
     bbox_min_vox: Tuple[int, int, int]        # (minx, miny, minz) in VAST global voxel space
-    voxel_size_um: Tuple[float, float, float] # (sx, sy, sz) — voxel dimensions in µm
+    voxel_size_um: Tuple[float, float, float] # (sx, sy, sz) -- voxel dimensions in µm
     
     # Explicit coordinate frame labels
     mask_index_frame: CoordFrame = 'numpy_array_index_zyx'
@@ -193,18 +193,18 @@ class VoxelCleaner:
 
     Pipeline order
     --------------
-    1. Morphological closing  — bridges annotation gaps so that interior
+    1. Morphological closing  -- bridges annotation gaps so that interior
        voids become truly enclosed (not connected to the exterior).
-    2. Component filtering    — discard small specks / keep largest.
-    3. Hole filling           — seal now-enclosed interior voids.
-    4. Smoothing              — optional surface regularisation.
+    2. Component filtering    -- discard small specks / keep largest.
+    3. Hole filling           -- seal now-enclosed interior voids.
+    4. Smoothing              -- optional surface regularisation.
 
     Recommended parameters for barn owl auditory cortex data
     ---------------------------------------------------------
     Gap source: incomplete boundary mask + fill workflow produces surface
     discontinuities of 0.6-1.1 µm (occasionally up to ~2 µm).
     Internal dark structures (mitochondria, vesicles) are not biology to
-    preserve — the entire neuron interior should be solid.
+    preserve -- the entire neuron interior should be solid.
 
     Recommended settings:
       closing_radius_um = 0.05   # bridges typical 0.6-1.1 µm gaps
@@ -245,7 +245,7 @@ class VoxelCleaner:
                                    3D after the closing step.
             fill_holes_per_axis  : Additionally fill holes in each 2D slice
                                    along Z, Y, and X and union the results.
-                                   More aggressive than the 3D fill alone —
+                                   More aggressive than the 3D fill alone --
                                    catches elongated voids that are open-ended
                                    in 3D (e.g. a gap running the length of a
                                    dendrite) but appear closed in cross-section.
@@ -288,7 +288,7 @@ class VoxelCleaner:
           • Use closing_iterations=2 or 3 if a single pass is insufficient.
 
         Borders that do not touch (surface discontinuities):
-          • Increase closing_radius_um — the closing diameter must exceed the
+          • Increase closing_radius_um -- the closing diameter must exceed the
             physical gap width.
           • Increase closing_iterations to reach gaps through narrow passages.
           • After cleaning, inspect stats['closing_voxels_added'] per iteration
@@ -368,7 +368,7 @@ class VoxelCleaner:
                 )
                 if added == 0:
                     self.logger.info(
-                        "[clean_masks]  No new voxels bridged — stopping early"
+                        "[clean_masks]  No new voxels bridged -- stopping early"
                     )
                     stats['closing_iterations_run'] = i + 1
                     break
@@ -386,13 +386,13 @@ class VoxelCleaner:
 
         if num_components == 0:
             self.logger.warning("[clean_masks] Input mask is empty after closing")
-            raise ValueError("Input mask is empty after closing — no components found")
+            raise ValueError("Input mask is empty after closing -- no components found")
 
         component_sizes = np.bincount(labeled_mask.ravel())
         component_sizes[0] = 0   # exclude background
 
         self.logger.info(
-            f"[clean_masks] Found {num_components} connected components — "
+            f"[clean_masks] Found {num_components} connected components -- "
             f"min={component_sizes[1:].min():,}  "
             f"max={component_sizes[1:].max():,}  "
             f"median={int(np.median(component_sizes[1:])):,}"
@@ -419,10 +419,10 @@ class VoxelCleaner:
         # ------------------------------------------------------------------
         # Step 3: Fill holes
         #
-        # 3a. 3D fill — scipy flood-fills from the exterior; seals voids that
+        # 3a. 3D fill -- scipy flood-fills from the exterior; seals voids that
         #     are fully enclosed in 3D after closing.
         #
-        # 3b. Per-axis 2D fill (optional) — fills holes in every cross-section
+        # 3b. Per-axis 2D fill (optional) -- fills holes in every cross-section
         #     slice along Z, Y, and X independently, then unions the results.
         #     This catches elongated voids (e.g. a gap running along the axis
         #     of a dendrite) that appear open-ended in 3D but are closed in

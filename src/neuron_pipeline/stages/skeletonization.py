@@ -230,7 +230,7 @@ class SkeletonExtractor:
         minx, miny, minz = bbox_min_vox
 
         for i, coord in enumerate(skel_coords):
-            z, y, x = coord   # local voxel indices from np.argwhere — ZYX order
+            z, y, x = coord   # local voxel indices from np.argwhere -- ZYX order
             # Step 1: local -> global voxel (add bbox origin; bbox_min_vox = (minx, miny, minz))
             global_x_vox = x + minx
             global_y_vox = y + miny
@@ -754,7 +754,7 @@ class SkeletonExtractor:
             root_node : Optional explicit root (graph node ID).
 
         Returns:
-            (tree, n_dropped) — directed tree and number of disconnected
+            (tree, n_dropped) -- directed tree and number of disconnected
             components that were discarded (0 = fully connected).
         """
         if G.number_of_nodes() == 0:
@@ -850,7 +850,7 @@ class SkeletonExtractor:
             return tree
         if len(roots) > 1:
             # Multiple roots indicate graph_to_tree produced a disconnected
-            # DiGraph — this should not happen after the component check there,
+            # DiGraph -- this should not happen after the component check there,
             # but guard here in case the tree was constructed by other means.
             self.logger.warning(
                 f"insert_synthetic_soma: tree has {len(roots)} root nodes (in_degree==0). "

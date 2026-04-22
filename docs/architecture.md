@@ -74,12 +74,12 @@ ms-neuron-pipeline/
 3. **Phase 2 -- Centroid extraction for markers**
     - Export marker voxel masks (boutons/synapses/contacts) at an appropriate mip level.
     - Compute centroids (binary centroid: equal weight per voxel).
-    - Output: `centroids.csv` — one row per BOUTON/SYNAPSE/CONTACT, used as input to Phase 3.
+    - Output: `centroids.csv` -- one row per BOUTON/SYNAPSE/CONTACT, used as input to Phase 3.
 
 4. **Phase 3 -- Marker-to-SWC mapping**
     - For each centroid, find the nearest point on the parent skeleton cable (KDTree over all structural nodes + edge intermediate samples).
     - Record the nearest edge (edge_u, edge_v), arc fraction along that edge, physical position, and Euclidean distance from centroid to cable.
-    - Output: `cable_mappings.csv` — consumed by Phase 4.
+    - Output: `cable_mappings.csv` -- consumed by Phase 4.
 
 5. **Phase 4 -- Connectivity export**
     - Join SYNAPSE and CONTACT annotations with their pre- and post-synaptic cable locations from Phase 3.
@@ -302,7 +302,7 @@ inclusion in a simulation.
 
 ### `connectivity_summary.csv` (Phase 4)
 
-One row per (axon, post_syn) pair — a compact overview of connection strength and mapping quality.
+One row per (axon, post_syn) pair -- a compact overview of connection strength and mapping quality.
 
 | Column | Description |
 |--------|-------------|

@@ -1,5 +1,5 @@
 """
-Voxel Mask ASCII Viewer — Diagnostic Utility
+Voxel Mask ASCII Viewer -- Diagnostic Utility
 Neural Reconstruction Pipeline
 
 Displays a .npz voxel mask slice-by-slice in the terminal using only
@@ -116,7 +116,7 @@ def nearest_filled_center(sl: np.ndarray, vr: int, vc: int, view_rows: int, view
     """
     rows, cols = np.where(sl)
     if len(rows) == 0:
-        return vr, vc   # empty slice — nothing to snap to
+        return vr, vc   # empty slice -- nothing to snap to
 
     # Check whether any filled voxel already falls inside the viewport
     r_min = vr;         r_max = vr + view_rows - 1
@@ -124,7 +124,7 @@ def nearest_filled_center(sl: np.ndarray, vr: int, vc: int, view_rows: int, view
     visible = ((rows >= r_min) & (rows <= r_max) &
                (cols >= c_min) & (cols <= c_max))
     if visible.any():
-        return vr, vc   # content already visible — don't auto-pan
+        return vr, vc   # content already visible -- don't auto-pan
 
     # Find the filled voxel closest to the viewport center
     cr = vr + view_rows // 2

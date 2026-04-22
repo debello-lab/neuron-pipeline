@@ -240,7 +240,7 @@ def main():
             print(f"No .swc files found in {diag_dir}")
             sys.exit(1)
         swc_path = swc_files[-1]
-        print(f"No file specified — loading newest: {swc_path.name}")
+        print(f"No file specified -- loading newest: {swc_path.name}")
 
     if not swc_path.exists():
         print(f"File not found: {swc_path}")
@@ -248,7 +248,7 @@ def main():
 
     nodes, meta = parse_swc(swc_path)
     if not nodes:
-        print("No samples parsed — is this a valid SWC file?")
+        print("No samples parsed -- is this a valid SWC file?")
         sys.exit(1)
 
     print_summary(nodes, meta, str(swc_path))

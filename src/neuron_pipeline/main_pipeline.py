@@ -182,7 +182,7 @@ def _write_review_queue(
     Write (or append to) review_queue.csv for segments that need human inspection.
 
     Each entry represents a segment where automated cleaning produced suspicious
-    metrics — either a high closing fraction (closing added >20% of volume) or
+    metrics -- either a high closing fraction (closing added >20% of volume) or
     residual fragmentation (multiple components remained after cleaning).
 
     The file appends on re-runs so successive pipeline runs accumulate the queue.
@@ -268,7 +268,7 @@ def _write_pipeline_report(
     output_dir: str,
     logger: logging.Logger,
 ) -> None:
-    """Write pipeline_report.txt — single-page summary of the full run."""
+    """Write pipeline_report.txt -- single-page summary of the full run."""
     from collections import Counter
     from datetime import datetime
     import csv as _csv
@@ -285,7 +285,7 @@ def _write_pipeline_report(
           f"Output dir: {output_dir}", "=" * W]
 
     # --- Phase 0 ---
-    L += section("PHASE 0 — SEGMENT CLASSIFICATION")
+    L += section("PHASE 0 -- SEGMENT CLASSIFICATION")
     role_counts = Counter(i.role for i in registry.segments.values())
     for role in ('AXON', 'POST_SYN', 'BOUTON', 'SYNAPSE', 'CONTACT', 'UNKNOWN'):
         if role_counts.get(role):
@@ -298,7 +298,7 @@ def _write_pipeline_report(
         L.append(f"  WARN: {w}")
 
     # --- Phase 1 ---
-    L += section("PHASE 1 — SKELETONIZATION")
+    L += section("PHASE 1 -- SKELETONIZATION")
     n_targets = sum(1 for i in registry.segments.values() if i.role in ('AXON', 'POST_SYN'))
     n_trees   = len(trees)
     L.append(f"  Targets : {n_targets}")
@@ -314,14 +314,14 @@ def _write_pipeline_report(
             med = lengths[len(lengths) // 2]
             L.append(
                 f"  Cable length (n={len(lengths)}): "
-                f"min={lengths[0]:.1f}  med={med:.1f}  max={lengths[-1]:.1f} µm"
+                f"min={lengths[0]:.1f}  med={med:.1f}  max={lengths[-1]:.1f} um"
             )
             n_drop = sum(int(r.get('skel_components_dropped', 0)) for r in skel_rows)
             if n_drop:
                 L.append(f"  Disconnected components dropped: {n_drop} (inspect those SWCs)")
 
     # --- Phase 2 ---
-    L += section("PHASE 2 — CENTROID EXTRACTION")
+    L += section("PHASE 2 -- CENTROID EXTRACTION")
     if centroids is not None and centroids.entries:
         role_c = Counter(e.role for e in centroids.entries)
         for role in ('BOUTON', 'SYNAPSE', 'CONTACT', 'POST_SYN'):
@@ -332,7 +332,7 @@ def _write_pipeline_report(
         L.append("  (not run or empty)")
 
     # --- Phase 3 ---
-    L += section("PHASE 3 — CABLE MAPPING")
+    L += section("PHASE 3 -- CABLE MAPPING")
     if mappings is not None and mappings.entries:
         non_post = [e for e in mappings.entries if e.centroid_role != 'POST_SYN']
         qc = Counter(e.qc_distance_flag for e in non_post)
@@ -342,14 +342,14 @@ def _write_pipeline_report(
             med_d = dists[len(dists) // 2]
             L.append(
                 f"  BOUTON/SYNAPSE/CONTACT distance: "
-                f"min={dists[0]:.2f}  med={med_d:.2f}  max={dists[-1]:.2f} µm"
+                f"min={dists[0]:.2f}  med={med_d:.2f}  max={dists[-1]:.2f} um"
             )
         L.append(f"  QC: ok={qc.get('ok',0)}  warn={qc.get('warn',0)}  suspicious={qc.get('suspicious',0)}")
     else:
         L.append("  (not run or empty)")
 
     # --- Phase 4 ---
-    L += section("PHASE 4 — CONNECTIVITY")
+    L += section("PHASE 4 -- CONNECTIVITY")
     if connectivity is not None and connectivity.rows:
         syns = [r for r in connectivity.rows if r.connection_type == 'synapse']
         cons = [r for r in connectivity.rows if r.connection_type == 'contact']
@@ -372,7 +372,7 @@ def _write_pipeline_report(
         ("arbor_recipe.json",       False),
         ("review_queue.csv",        False),
         ("stats/skeleton_stats.csv",False),
-        ("pipeline_report.txt",     False),
+        ("pipeline_report.txt",     True),
     ]
     for fname, is_dir in check:
         p = Path(output_dir) / fname
@@ -567,7 +567,7 @@ def run_phase1(
 
             if removed_pct > 40.0:
                 log_warning_box(logger, "CLEANING", name,
-                                f"Removed {removed_pct:.1f}% of voxels — skeleton quality may be poor",
+                                f"Removed {removed_pct:.1f}% of voxels -- skeleton quality may be poor",
                                 {'original': original_voxels, 'remaining': remaining})
                 warnings.append(WarningRecord(name, "cleaning",
                                               f"removed {removed_pct:.1f}%", "medium"))
@@ -631,14 +631,14 @@ def run_phase1(
                     msg = (
                         f"Cable length {total_um:.1f} µm exceeds 2x dataset diagonal "
                         f"({CABLE_ARTIFACT_UM:.1f} µm). Likely skeletonization artifact "
-                        f"— inspect SWC for cycles or webbing."
+                        f"-- inspect SWC for cycles or webbing."
                     )
                     log_warning_box(logger, "SKELETONIZATION", name, msg)
                     warnings.append(WarningRecord(name, "skeletonization", msg, "high"))
                 elif total_um > CABLE_TORTUOUS_UM:
                     msg = (
                         f"Cable length {total_um:.1f} µm exceeds dataset diagonal "
-                        f"({CABLE_TORTUOUS_UM:.1f} µm) — segment is tortuous or "
+                        f"({CABLE_TORTUOUS_UM:.1f} µm) -- segment is tortuous or "
                         f"contains minor looping."
                     )
                     log_warning_box(logger, "SKELETONIZATION", name, msg)
@@ -851,19 +851,19 @@ def run_phase4(
       - Phase 3 mappings  (cable locations for each centroid)
 
     Produces:
-      <output_dir>/connectivity.csv   — full edge list for analysis
-      <output_dir>/arbor_recipe.json  — Arbor-ready network description
+      <output_dir>/connectivity.csv   -- full edge list for analysis
+      <output_dir>/arbor_recipe.json  -- Arbor-ready network description
 
     Args:
         registry      : SegmentRegistry from Phase 0.
-        trees         : Phase 1 output — cell_name -> (tree, swc_path).
-        mapping_table : Phase 3 output — CableMappingTable.
+        trees         : Phase 1 output -- cell_name -> (tree, swc_path).
+        mapping_table : Phase 3 output -- CableMappingTable.
         logger        : Shared pipeline logger.
         output_dir    : Base output directory.
         syn_mechanism : Arbor synapse mechanism name (default: 'expsyn').
 
     Returns:
-        ConnectivityOutput — in-memory connectivity table.
+        ConnectivityOutput -- in-memory connectivity table.
     """
     builder = ConnectivityBuilder(logger=logger)
     connectivity, csv_path, recipe_path = builder.build(
@@ -902,7 +902,7 @@ def _parse_args() -> argparse.Namespace:
         description="Neuron reconstruction pipeline (phases 0-4)",
     )
 
-    # Phase control — mutually exclusive
+    # Phase control -- mutually exclusive
     phase_group = p.add_mutually_exclusive_group()
     phase_group.add_argument(
         "--phases", nargs="+", type=int, metavar="N",
@@ -1161,12 +1161,12 @@ def main():
         + (f"  segments={sorted(only_segments)}" if only_segments else "")
     )
 
-    # Phase 0: always run — downstream phases need the SegmentRegistry
+    # Phase 0: always run -- downstream phases need the SegmentRegistry
     classifier = SegmentClassifier()
     registry = classifier.classify_segments()
 
     if not registry.segments:
-        logger.error("Phase 0: registry is empty — aborting")
+        logger.error("Phase 0: registry is empty -- aborting")
         return
 
     # ------------------------------------------------------------------
@@ -1243,7 +1243,7 @@ def main():
         if missing_parents:
             logger.warning(
                 f"Phase 3: {len(missing_parents)} parent axon(s) absent from trees "
-                f"— their centroids will be skipped: {sorted(missing_parents)}"
+                f"-- their centroids will be skipped: {sorted(missing_parents)}"
             )
 
         mappings = run_phase3(
@@ -1266,7 +1266,7 @@ def main():
     connectivity = None
     if 4 in active:
         if not mappings.entries:
-            logger.warning("Phase 4: mapping table is empty — connectivity output will be empty")
+            logger.warning("Phase 4: mapping table is empty -- connectivity output will be empty")
 
         connectivity = run_phase4(
             registry=registry,

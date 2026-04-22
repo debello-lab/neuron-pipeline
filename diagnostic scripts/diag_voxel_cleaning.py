@@ -11,8 +11,8 @@ Also runs quantitative checks at each stage:
 
 Tests
 -----
-1. Full neuron  — all cleaning stages on the complete mask
-2. Single slice — middle Z-slice window, same stages (skipped if too thin)
+1. Full neuron  -- all cleaning stages on the complete mask
+2. Single slice -- middle Z-slice window, same stages (skipped if too thin)
 
 Cleaning stages
 ---------------
@@ -297,7 +297,7 @@ def mask_to_obj(
     Returns (n_verts, n_faces).
     """
     if not mask.any():
-        log.warning(f"  Mask is empty — skipping {filepath.name}")
+        log.warning(f"  Mask is empty -- skipping {filepath.name}")
         return 0, 0
 
     verts, faces, _, _ = marching_cubes(mask, level=0.5)
@@ -316,7 +316,7 @@ def mask_to_obj(
 
     filepath.parent.mkdir(parents=True, exist_ok=True)
     with open(filepath, "w") as f:
-        f.write(f"# Voxel cleaning diagnostic — {filepath.stem}\n")
+        f.write(f"# Voxel cleaning diagnostic -- {filepath.stem}\n")
         for v in verts_um:
             f.write(f"v {v[0]:.4f} {v[1]:.4f} {v[2]:.4f}\n")
         for face in faces:
@@ -348,7 +348,7 @@ def run_stage_tests(
     # ------------------------------------------------------------------
     # Stage 00: raw (no cleaning)
     # ------------------------------------------------------------------
-    log.info(f"[{prefix}] Stage 00 — raw mask ({int(mask.sum()):,} filled voxels)")
+    log.info(f"[{prefix}] Stage 00 -- raw mask ({int(mask.sum()):,} filled voxels)")
     mask_to_obj(mask, voxel_size_um, output_dir / f"{prefix}_00_raw.obj")
     mask_to_npz(mask, voxel_size_um, bbox_min_vox, segment_id, segment_name, output_dir / f"{prefix}_00_raw.npz")
     all_metrics.append(run_quantitative_checks(mask, "00_raw"))
@@ -356,7 +356,7 @@ def run_stage_tests(
     # ------------------------------------------------------------------
     # Stage 01: morphological closing only
     # ------------------------------------------------------------------
-    log.info(f"[{prefix}] Stage 01 — closing")
+    log.info(f"[{prefix}] Stage 01 -- closing")
     vd01, stats01 = cleaner.clean_mask(
         mask,
         closing_radius_um=1.2,
@@ -366,7 +366,7 @@ def run_stage_tests(
         voxel_size_um=voxel_size_um,
     )
     if not vd01.mask.any():
-        log.warning(f"[{prefix}] Stage 01 produced empty mask — skipping remaining stages")
+        log.warning(f"[{prefix}] Stage 01 produced empty mask -- skipping remaining stages")
         return
     log.info(
         f"  closing_voxels_added={stats01['closing_voxels_added']:,}  "
@@ -379,7 +379,7 @@ def run_stage_tests(
     # ------------------------------------------------------------------
     # Stage 02: closing + keep largest component
     # ------------------------------------------------------------------
-    log.info(f"[{prefix}] Stage 02 — closing + component filter")
+    log.info(f"[{prefix}] Stage 02 -- closing + component filter")
     vd02, stats02 = cleaner.clean_mask(
         mask,
         closing_radius_um=1.2,
@@ -399,7 +399,7 @@ def run_stage_tests(
     # ------------------------------------------------------------------
     # Stage 03: closing + component filter + hole fill
     # ------------------------------------------------------------------
-    log.info(f"[{prefix}] Stage 03 — closing + component filter + hole fill")
+    log.info(f"[{prefix}] Stage 03 -- closing + component filter + hole fill")
     vd03, stats03 = cleaner.clean_mask(
         mask,
         closing_radius_um=1.2,
@@ -447,7 +447,7 @@ def main() -> None:
     )
 
     if mask is None or voxel_size is None or bbox_min is None:
-        log.error("Voxel extraction failed — is the segment ID valid?")
+        log.error("Voxel extraction failed -- is the segment ID valid?")
         return
 
     log.info(
@@ -456,7 +456,7 @@ def main() -> None:
     )
 
     # ------------------------------------------------------------------
-    # Test 1: Full neuron — cleaning stages on the complete mask
+    # Test 1: Full neuron -- cleaning stages on the complete mask
     # ------------------------------------------------------------------
     log.info("=" * 60)
     log.info("TEST 1: Full neuron")
@@ -473,7 +473,7 @@ def main() -> None:
     )
 
     # ------------------------------------------------------------------
-    # Test 2: Single slice — middle Z window of the mask
+    # Test 2: Single slice -- middle Z window of the mask
     # ------------------------------------------------------------------
     log.info("=" * 60)
     log.info("TEST 2: Single slice")
@@ -481,7 +481,7 @@ def main() -> None:
 
     n_z = mask.shape[0]
     if n_z < 3:
-        log.warning(f"Mask has only {n_z} Z-slices — skipping single-slice test.")
+        log.warning(f"Mask has only {n_z} Z-slices -- skipping single-slice test.")
     else:
         z_center = n_z // 2
         z_lo = max(0, z_center - SLICE_HALF_WIDTH)
@@ -493,7 +493,7 @@ def main() -> None:
             f"filled voxels={int(slice_mask.sum()):,}"
         )
         if not slice_mask.any():
-            log.warning("Slice contains no filled voxels — skipping single-slice test.")
+            log.warning("Slice contains no filled voxels -- skipping single-slice test.")
         else:
             run_stage_tests(
                 mask=slice_mask,
