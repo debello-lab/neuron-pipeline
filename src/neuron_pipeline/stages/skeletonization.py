@@ -74,6 +74,12 @@ class SkeletonExtractor:
             'compressed_nodes': 0,
             'compressed_edges': 0,
             'branches_pruned': 0,
+            'bouton_clusters_collapsed': 0,
+            'bouton_nodes_removed': 0,
+            'bouton_radius_threshold_um': 0.0,
+            'branch_count': 0,       # nodes with degree > 2 in pruned graph (true bifurcations)
+            'endpoint_count': 0,     # nodes with degree == 1 in pruned graph
+            'components_dropped': 0, # disconnected components discarded by graph_to_tree
             'total_length_um': 0.0,
             'coord_frame': 'physical_um_xyz_center',
         }
@@ -142,15 +148,46 @@ class SkeletonExtractor:
         stats['compressed_edges'] = G_compressed.number_of_edges()
 
         # ------------------------------------------------------------------
+        # Step 5b: Collapse bouton swelling clusters
+        #
+        # Medial axis thinning produces dense node clouds inside
+        # bulbous regions (boutons, spine heads).  These inflate cable
+        # length when BFS threads through the cluster.  Replace each
+        # cluster with a single centroid node.
+        # ------------------------------------------------------------------
+        G_compressed, collapse_stats = self.collapse_high_radius_clusters(
+            G_compressed,
+        )
+        stats['bouton_clusters_collapsed'] = collapse_stats['clusters_collapsed']
+        stats['bouton_nodes_removed'] = collapse_stats['nodes_removed']
+        stats['bouton_radius_threshold_um'] = collapse_stats['radius_threshold_um']
+
+        # ------------------------------------------------------------------
         # Step 6: Spur pruning
         # ------------------------------------------------------------------
         G_pruned, spurs_removed = self.prune_spurs(G_compressed, spur_length_um)
         stats['branches_pruned'] = spurs_removed
 
+        # Topology metrics on the pruned graph (before soma stub is inserted).
+        # branch_count: nodes where degree > 2 = true bifurcation points.
+        # endpoint_count: nodes where degree == 1 = cable tips.
+        stats['branch_count']   = sum(1 for n in G_pruned.nodes() if G_pruned.degree(n) > 2)
+        stats['endpoint_count'] = sum(1 for n in G_pruned.nodes() if G_pruned.degree(n) == 1)
+        self.logger.info(
+            f"Pruned graph: {G_pruned.number_of_nodes()} nodes, "
+            f"{stats['branch_count']} branch points, {stats['endpoint_count']} endpoints"
+        )
+
         # ------------------------------------------------------------------
         # Step 7: Convert to rooted directed tree
         # ------------------------------------------------------------------
-        tree = self.graph_to_tree(G_pruned)
+        tree, n_dropped = self.graph_to_tree(G_pruned)
+        stats['components_dropped'] = n_dropped
+        if n_dropped > 0:
+            self.logger.warning(
+                f"graph_to_tree dropped {n_dropped} disconnected component(s). "
+                f"Inspect SWC for narrow necks or thin bridges not captured at this voxel resolution."
+            )
 
         # ------------------------------------------------------------------
         # Step 8: Insert synthetic 2-sample soma for Arbor compatibility
@@ -205,7 +242,7 @@ class SkeletonExtractor:
             G.add_node(i, pos=(pos_x_um, pos_y_um, pos_z_um), voxel_pos=coord)
 
         for i, coord in enumerate(skel_coords):
-            for j in kd.query_ball_point(coord, r=1.8):   # sqrt(3) + margin = 26-conn
+            for j in kd.query_ball_point(coord, r=1.8):   # 1.8 > sqrt(3) ≈ 1.73 captures all 26-connected neighbors
                 if i < j:
                     pi = G.nodes[i]['pos']
                     pj = G.nodes[j]['pos']
@@ -397,6 +434,260 @@ class SkeletonExtractor:
         return pts, rads
 
     # -------------------------------------------------------------------------
+    # Step 5b: Collapse bouton swelling clusters
+    # -------------------------------------------------------------------------
+
+    def collapse_high_radius_clusters(
+        self,
+        G: nx.Graph,
+        radius_factor: float = 2.5,
+        min_cluster_nodes: int = 3,
+    ) -> Tuple[nx.Graph, Dict[str, Any]]:
+        """
+        Collapse dense node clusters caused by bouton swellings.
+
+        Medial axis thinning produces a medial surface (not a centerline)
+        inside bulbous regions such as bouton swellings.  After graph
+        compression these appear as tightly connected subgraphs of nodes
+        with abnormally large radii.  BFS tree construction then threads
+        through every node in the cluster, inflating cable length.
+
+        This method identifies spatially overlapping high-radius nodes
+        using single-linkage clustering and replaces each cluster with a
+        single centroid node, preserving external connectivity.
+
+        Args:
+            G               : Compressed undirected skeleton graph.
+                              Node attrs: pos, radius, degree.
+                              Edge attrs: length, points, radii.
+            radius_factor   : Nodes with radius > radius_factor * median_radius
+                              are candidates for collapsing.
+            min_cluster_nodes : Minimum cluster size to collapse (skip singletons
+                              and pairs).
+
+        Returns:
+            (collapsed_graph, collapse_stats)
+            collapse_stats keys:
+                radius_threshold_um  -- threshold used (um)
+                median_radius_um     -- median node radius (um)
+                candidates_found     -- number of nodes above threshold
+                clusters_found       -- number of clusters identified
+                clusters_collapsed   -- number of clusters that met min_cluster_nodes
+                nodes_removed        -- total nodes removed by collapsing
+        """
+        zero_stats: Dict[str, Any] = {
+            'radius_threshold_um': 0.0,
+            'median_radius_um': 0.0,
+            'candidates_found': 0,
+            'clusters_found': 0,
+            'clusters_collapsed': 0,
+            'nodes_removed': 0,
+        }
+
+        if G.number_of_nodes() < min_cluster_nodes:
+            return G.copy(), zero_stats
+
+        # --- Compute threshold -------------------------------------------------
+        all_radii = np.array([G.nodes[n]['radius'] for n in G.nodes()])
+        median_radius = float(np.median(all_radii))
+        radius_threshold = radius_factor * median_radius
+
+        self.logger.info(
+            f"Bouton collapse: median_radius={median_radius:.3f} um, "
+            f"threshold={radius_threshold:.3f} um (factor={radius_factor})"
+        )
+
+        # --- Identify candidates -----------------------------------------------
+        candidates = [n for n in G.nodes() if G.nodes[n]['radius'] > radius_threshold]
+
+        if not candidates:
+            self.logger.info("Bouton collapse: no nodes above threshold -- skipping")
+            zero_stats['median_radius_um'] = median_radius
+            zero_stats['radius_threshold_um'] = radius_threshold
+            return G.copy(), zero_stats
+
+        if len(candidates) == G.number_of_nodes():
+            self.logger.warning(
+                f"Bouton collapse: all {G.number_of_nodes()} nodes above threshold "
+                "-- skipping (segment may be uniformly large)"
+            )
+            zero_stats['median_radius_um'] = median_radius
+            zero_stats['radius_threshold_um'] = radius_threshold
+            zero_stats['candidates_found'] = len(candidates)
+            return G.copy(), zero_stats
+
+        # --- Single-linkage clustering via Union-Find + KDTree -----------------
+        cand_list = list(candidates)
+        cand_pos = np.array([G.nodes[n]['pos'] for n in cand_list])
+        cand_radii = np.array([G.nodes[n]['radius'] for n in cand_list])
+
+        # Union-Find with path compression
+        parent = list(range(len(cand_list)))
+
+        def _find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def _union(a: int, b: int) -> None:
+            ra, rb = _find(a), _find(b)
+            if ra != rb:
+                parent[ra] = rb
+
+        # Find candidate pairs within max possible radius
+        max_radius = float(cand_radii.max())
+        kd = KDTree(cand_pos)
+        pairs = kd.query_pairs(r=max_radius)
+
+        for i, j in pairs:
+            dist = float(np.linalg.norm(cand_pos[i] - cand_pos[j]))
+            link_threshold = max(cand_radii[i], cand_radii[j])
+            if dist < link_threshold:
+                _union(i, j)
+
+        # Group into clusters
+        clusters_map: Dict[int, List[int]] = {}
+        for idx in range(len(cand_list)):
+            root = _find(idx)
+            clusters_map.setdefault(root, []).append(cand_list[idx])
+
+        all_clusters = list(clusters_map.values())
+        clusters = [c for c in all_clusters if len(c) >= min_cluster_nodes]
+
+        self.logger.info(
+            f"Bouton collapse: {len(candidates)} candidates, "
+            f"{len(all_clusters)} cluster(s) total, "
+            f"{len(clusters)} cluster(s) >= {min_cluster_nodes} nodes"
+        )
+
+        if not clusters:
+            stats = dict(zero_stats)
+            stats['median_radius_um'] = median_radius
+            stats['radius_threshold_um'] = radius_threshold
+            stats['candidates_found'] = len(candidates)
+            stats['clusters_found'] = len(all_clusters)
+            return G.copy(), stats
+
+        # --- Batch collapse ----------------------------------------------------
+        orig_components = nx.number_connected_components(G)
+
+        # Build mapping: old member node -> centroid ID
+        member_to_centroid: Dict[int, int] = {}
+        centroid_info: Dict[int, Tuple[Tuple[float, float, float], float]] = {}
+        next_id = max(G.nodes()) + 1
+
+        for cluster in clusters:
+            cid = next_id
+            next_id += 1
+            pos = tuple(float(x) for x in np.mean(
+                [G.nodes[n]['pos'] for n in cluster], axis=0
+            ))
+            rad = float(max(G.nodes[n]['radius'] for n in cluster))
+            for n in cluster:
+                member_to_centroid[n] = cid
+            centroid_info[cid] = (pos, rad)
+
+            self.logger.debug(
+                f"  Cluster: {len(cluster)} nodes -> centroid at "
+                f"({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f}), radius={rad:.3f} um"
+            )
+
+        # Build new graph
+        G_out = nx.Graph()
+
+        # Add non-cluster nodes unchanged
+        for n, attrs in G.nodes(data=True):
+            if n not in member_to_centroid:
+                G_out.add_node(n, **attrs)
+
+        # Add centroid nodes
+        for cid, (pos, rad) in centroid_info.items():
+            G_out.add_node(cid, pos=pos, radius=rad, degree=0)
+
+        # Process edges: remap endpoints, drop intra-cluster, dedup
+        for u, v, data in G.edges(data=True):
+            u_mapped = member_to_centroid.get(u, u)
+            v_mapped = member_to_centroid.get(v, v)
+
+            # Skip intra-cluster edges (self-loops after remapping)
+            if u_mapped == v_mapped:
+                continue
+
+            # Recompute length between (possibly new) endpoint positions
+            pos_u = centroid_info[u_mapped][0] if u_mapped in centroid_info else G.nodes[u]['pos']
+            pos_v = centroid_info[v_mapped][0] if v_mapped in centroid_info else G.nodes[v]['pos']
+            new_length = float(np.linalg.norm(
+                np.array(pos_u) - np.array(pos_v)
+            ))
+
+            # Filter intermediate samples: drop points inside cluster spheres
+            old_points = data.get('points', [])
+            old_radii = data.get('radii', [])
+            new_points: List[Tuple[float, float, float]] = []
+            new_radii: List[float] = []
+            for pt, r in zip(old_points, old_radii):
+                pt_arr = np.array(pt)
+                inside = False
+                # Check against each centroid that is an endpoint of this edge
+                for endpoint_cid in (u_mapped, v_mapped):
+                    if endpoint_cid in centroid_info:
+                        cpos, crad = centroid_info[endpoint_cid]
+                        if float(np.linalg.norm(pt_arr - np.array(cpos))) < crad:
+                            inside = True
+                            break
+                if not inside:
+                    new_points.append(pt)
+                    new_radii.append(r)
+
+            # Deduplicate: keep shortest edge between same mapped pair
+            edge_key = (min(u_mapped, v_mapped), max(u_mapped, v_mapped))
+            if G_out.has_edge(edge_key[0], edge_key[1]):
+                existing_length = G_out[edge_key[0]][edge_key[1]]['length']
+                if new_length < existing_length:
+                    G_out[edge_key[0]][edge_key[1]]['length'] = new_length
+                    G_out[edge_key[0]][edge_key[1]]['points'] = new_points
+                    G_out[edge_key[0]][edge_key[1]]['radii'] = new_radii
+            else:
+                G_out.add_edge(
+                    u_mapped, v_mapped,
+                    length=new_length,
+                    points=new_points,
+                    radii=new_radii,
+                )
+
+        # Refresh degree attribute
+        for n in G_out.nodes():
+            G_out.nodes[n]['degree'] = G_out.degree(n)
+
+        # Connectivity safety check
+        new_components = nx.number_connected_components(G_out)
+        if new_components != orig_components:
+            self.logger.warning(
+                f"Bouton collapse: connectivity changed from {orig_components} "
+                f"to {new_components} components -- graph may be damaged"
+            )
+
+        total_members = sum(len(c) for c in clusters)
+        nodes_removed = total_members - len(clusters)  # each cluster adds 1 centroid
+
+        self.logger.info(
+            f"Bouton collapse: {len(clusters)} cluster(s) collapsed, "
+            f"{nodes_removed} nodes removed, "
+            f"{G_out.number_of_nodes()} nodes remaining"
+        )
+
+        collapse_stats: Dict[str, Any] = {
+            'radius_threshold_um': radius_threshold,
+            'median_radius_um': median_radius,
+            'candidates_found': len(candidates),
+            'clusters_found': len(all_clusters),
+            'clusters_collapsed': len(clusters),
+            'nodes_removed': nodes_removed,
+        }
+        return G_out, collapse_stats
+
+    # -------------------------------------------------------------------------
     # Step 6: Spur pruning
     # -------------------------------------------------------------------------
 
@@ -448,7 +739,7 @@ class SkeletonExtractor:
         self,
         G: nx.Graph,
         root_node: Optional[int] = None,
-    ) -> nx.DiGraph:
+    ) -> Tuple[nx.DiGraph, int]:
         """
         Convert a compressed undirected graph to a BFS-rooted directed tree.
 
@@ -463,10 +754,11 @@ class SkeletonExtractor:
             root_node : Optional explicit root (graph node ID).
 
         Returns:
-            Directed tree (NetworkX DiGraph) with same node/edge attributes.
+            (tree, n_dropped) — directed tree and number of disconnected
+            components that were discarded (0 = fully connected).
         """
         if G.number_of_nodes() == 0:
-            return nx.DiGraph()
+            return nx.DiGraph(), 0
 
         if root_node is None:
             endpoints = [n for n in G.nodes() if G.nodes[n].get('degree', G.degree(n)) == 1]
@@ -491,14 +783,14 @@ class SkeletonExtractor:
         # Instead, restrict the tree to the root's component only and log what
         # was dropped so the caller can decide how to handle it.
         n_components = nx.number_connected_components(G)
-        if n_components > 1:
+        n_dropped = n_components - 1
+        if n_dropped > 0:
             root_component = nx.node_connected_component(G, root_node)
             dropped_nodes = G.number_of_nodes() - len(root_component)
-            dropped_components = n_components - 1
             self.logger.warning(
                 f"graph_to_tree: skeleton graph has {n_components} connected components. "
                 f"Keeping root component ({len(root_component)} nodes). "
-                f"Dropping {dropped_components} component(s) ({dropped_nodes} nodes). "
+                f"Dropping {n_dropped} component(s) ({dropped_nodes} nodes). "
                 f"Consider inspecting skeletonization output for narrow necks or artifacts."
             )
             G = G.subgraph(root_component)
@@ -525,7 +817,7 @@ class SkeletonExtractor:
         self.logger.info(
             f"Tree: {tree.number_of_nodes()} nodes, {tree.number_of_edges()} edges"
         )
-        return tree
+        return tree, n_dropped
 
     # -------------------------------------------------------------------------
     # Step 8: Synthetic soma insertion

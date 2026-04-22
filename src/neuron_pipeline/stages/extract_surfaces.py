@@ -1067,7 +1067,11 @@ class SegmentSurfaceExtractor:
         # Create binary volume
         self.logger.info("Creating binary volume...")
         mask = (seg_image == segment_id).astype(bool)
-        
+        # get_seg_image_rle_decoded returns (X, Y, Z) via Fortran-order reshape.
+        # All downstream stages (distance_transform_edt sampling, skeleton_to_graph,
+        # centroid code, structuring element) expect (Z, Y, X) — transpose here once.
+        mask = mask.transpose(2, 1, 0)
+
         # Store the min bounds in voxels
         bbox_min_vox = (minx, miny, minz)
         
