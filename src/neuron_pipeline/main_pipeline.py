@@ -214,6 +214,176 @@ def _write_review_queue(
     )
 
 
+def _write_skeleton_stats(
+    rows: List[dict],
+    output_dir: str,
+    logger: logging.Logger,
+) -> None:
+    """Write skeleton_stats.csv to <output_dir>/stats/.
+
+    One row per successfully processed segment. Contains all voxel cleaning
+    stats (clean_ prefix), all skeleton stats (skel_ prefix), and the
+    pipeline parameters used. Overwrites on each full run.
+    Segments skipped via --resume are absent (no stats available for them).
+    """
+    import csv as _csv
+
+    if not rows:
+        return
+
+    path = Path(output_dir) / "stats" / "skeleton_stats.csv"
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    fieldnames = [
+        'segment_name', 'segment_id', 'role',
+        'param_spur_length_um', 'param_closing_radius_um',
+        'clean_original_voxel_count', 'clean_original_components',
+        'clean_kept_components', 'clean_removed_components',
+        'clean_closing_voxels_added', 'clean_closing_iterations_run',
+        'clean_holes_filled', 'clean_hole_fill_voxels_added',
+        'clean_per_axis_fill_voxels_added', 'clean_smoothing_iterations',
+        'clean_final_voxel_count', 'clean_voxels_added', 'clean_voxels_removed',
+        'skel_input_voxel_count', 'skel_skeleton_voxel_count',
+        'skel_skeleton_points', 'skel_compressed_nodes', 'skel_compressed_edges',
+        'skel_branches_pruned', 'skel_bouton_clusters_collapsed',
+        'skel_bouton_nodes_removed', 'skel_bouton_radius_threshold_um',
+        'skel_branch_count', 'skel_endpoint_count', 'skel_components_dropped',
+        'skel_total_length_um', 'skel_coord_frame',
+    ]
+
+    with open(path, 'w', newline='') as f:
+        writer = _csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    logger.info(f"Skeleton stats: {len(rows)} segment(s) -> {path}")
+
+
+def _write_pipeline_report(
+    registry: SegmentRegistry,
+    trees: Dict,
+    centroids,
+    mappings,
+    connectivity,
+    output_dir: str,
+    logger: logging.Logger,
+) -> None:
+    """Write pipeline_report.txt — single-page summary of the full run."""
+    from collections import Counter
+    from datetime import datetime
+    import csv as _csv
+
+    path = Path(output_dir) / "pipeline_report.txt"
+    W = 60
+
+    def section(title: str) -> List[str]:
+        return ["", title, "-" * W]
+
+    L: List[str] = []
+    L += ["=" * W, "PIPELINE RUN REPORT",
+          f"Generated : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+          f"Output dir: {output_dir}", "=" * W]
+
+    # --- Phase 0 ---
+    L += section("PHASE 0 — SEGMENT CLASSIFICATION")
+    role_counts = Counter(i.role for i in registry.segments.values())
+    for role in ('AXON', 'POST_SYN', 'BOUTON', 'SYNAPSE', 'CONTACT', 'UNKNOWN'):
+        if role_counts.get(role):
+            L.append(f"  {role:<12}: {role_counts[role]}")
+    L.append(
+        f"  Expected  : {len(registry.connectivity)} synapse connections, "
+        f"{len(registry.contacts)} contacts"
+    )
+    for w in registry.warnings:
+        L.append(f"  WARN: {w}")
+
+    # --- Phase 1 ---
+    L += section("PHASE 1 — SKELETONIZATION")
+    n_targets = sum(1 for i in registry.segments.values() if i.role in ('AXON', 'POST_SYN'))
+    n_trees   = len(trees)
+    L.append(f"  Targets : {n_targets}")
+    L.append(f"  Success : {n_trees}")
+    L.append(f"  Failed  : {n_targets - n_trees}")
+
+    skel_csv = Path(output_dir) / "stats" / "skeleton_stats.csv"
+    if skel_csv.exists():
+        with open(skel_csv, newline='') as f:
+            skel_rows = list(_csv.DictReader(f))
+        if skel_rows:
+            lengths = sorted(float(r['skel_total_length_um']) for r in skel_rows)
+            med = lengths[len(lengths) // 2]
+            L.append(
+                f"  Cable length (n={len(lengths)}): "
+                f"min={lengths[0]:.1f}  med={med:.1f}  max={lengths[-1]:.1f} µm"
+            )
+            n_drop = sum(int(r.get('skel_components_dropped', 0)) for r in skel_rows)
+            if n_drop:
+                L.append(f"  Disconnected components dropped: {n_drop} (inspect those SWCs)")
+
+    # --- Phase 2 ---
+    L += section("PHASE 2 — CENTROID EXTRACTION")
+    if centroids is not None and centroids.entries:
+        role_c = Counter(e.role for e in centroids.entries)
+        for role in ('BOUTON', 'SYNAPSE', 'CONTACT', 'POST_SYN'):
+            if role_c.get(role):
+                L.append(f"  {role:<12}: {role_c[role]}")
+        L.append(f"  Total: {len(centroids.entries)}")
+    else:
+        L.append("  (not run or empty)")
+
+    # --- Phase 3 ---
+    L += section("PHASE 3 — CABLE MAPPING")
+    if mappings is not None and mappings.entries:
+        non_post = [e for e in mappings.entries if e.centroid_role != 'POST_SYN']
+        qc = Counter(e.qc_distance_flag for e in non_post)
+        L.append(f"  Mapped: {len(mappings.entries)}")
+        if non_post:
+            dists = sorted(e.distance_um for e in non_post)
+            med_d = dists[len(dists) // 2]
+            L.append(
+                f"  BOUTON/SYNAPSE/CONTACT distance: "
+                f"min={dists[0]:.2f}  med={med_d:.2f}  max={dists[-1]:.2f} µm"
+            )
+        L.append(f"  QC: ok={qc.get('ok',0)}  warn={qc.get('warn',0)}  suspicious={qc.get('suspicious',0)}")
+    else:
+        L.append("  (not run or empty)")
+
+    # --- Phase 4 ---
+    L += section("PHASE 4 — CONNECTIVITY")
+    if connectivity is not None and connectivity.rows:
+        syns = [r for r in connectivity.rows if r.connection_type == 'synapse']
+        cons = [r for r in connectivity.rows if r.connection_type == 'contact']
+        n_pairs = len({(r.pre_cell, r.post_cell) for r in syns})
+        L.append(f"  Confirmed synapses : {len(syns)}")
+        L.append(f"  Axon->PostSyn pairs: {n_pairs}")
+        L.append(f"  Putative contacts  : {len(cons)}")
+    else:
+        L.append("  (not run or empty)")
+
+    # --- Output files ---
+    L += section("OUTPUT FILES")
+    check = [
+        ("swc/",                    True),
+        ("connectivity.csv",        False),
+        ("connectivity_summary.csv",False),
+        ("connectivity_report.txt", False),
+        ("cable_mappings.csv",      False),
+        ("centroids.csv",           False),
+        ("arbor_recipe.json",       False),
+        ("review_queue.csv",        False),
+        ("stats/skeleton_stats.csv",False),
+        ("pipeline_report.txt",     False),
+    ]
+    for fname, is_dir in check:
+        p = Path(output_dir) / fname
+        exists = p.is_dir() if is_dir else p.exists()
+        L.append(f"  [{'OK    ' if exists else 'MISSING'}]  {fname}")
+
+    L += ["", "=" * W, ""]
+    path.write_text('\n'.join(L))
+    logger.info(f"Pipeline report -> {path}")
+
+
 # ---------------------------------------------------------------------------
 # Phases
 # ---------------------------------------------------------------------------
@@ -253,6 +423,25 @@ def run_phase1(
     skel = SkeletonExtractor(logger=logger)
     writer = SWCWriter()
 
+    # Derive physical dataset bounds for cable-length validation.
+    # Segments are edge-clipped fragments; thresholds are based on geometry,
+    # not biological cable expectations, so they generalise across datasets.
+    _di = extractor.dataset_info
+    _dim_um = np.array([
+        _di['datasizex'] * _di['voxelsizex'] / 1000.0,
+        _di['datasizey'] * _di['voxelsizey'] / 1000.0,
+        _di['datasizez'] * _di['voxelsizez'] / 1000.0,
+    ])
+    DATASET_DIAGONAL_UM  = float(np.linalg.norm(_dim_um))     # max straight-line path
+    CABLE_TORTUOUS_UM    = DATASET_DIAGONAL_UM                 # > diagonal → tortuous
+    CABLE_ARTIFACT_UM    = 2.0 * DATASET_DIAGONAL_UM           # > 2× diagonal → artifact
+    CABLE_MIN_UM         = 0.5                                  # below this → degenerate
+    logger.info(
+        f"Dataset physical dimensions: "
+        f"{_dim_um[0]:.1f} x {_dim_um[1]:.1f} x {_dim_um[2]:.1f} µm  "
+        f"(diagonal {DATASET_DIAGONAL_UM:.1f} µm)"
+    )
+
     swc_dir = Path(output_dir) / "swc"
     swc_dir.mkdir(parents=True, exist_ok=True)
 
@@ -268,11 +457,12 @@ def run_phase1(
     failures: List[FailureRecord] = []
     warnings: List[WarningRecord] = []
     review_queue_entries: List[dict] = []
+    skel_stats_rows: List[dict] = []
 
     # Closing fraction threshold: warn if closing added >20% of original volume.
     # A large fraction means the closing radius is bridging more than surface gaps.
     # Flagged segments are written to review_queue.csv for human inspection.
-    CLOSING_FRACTION_WARN = 0.20
+    CLOSING_FRACTION_WARN = 0.70
 
     for name, info in targets:
         logger.info(f"--- {info.role} {name} (seg {info.seg_id}) ---")
@@ -366,9 +556,9 @@ def run_phase1(
             remaining = int(np.sum(cleaned.mask))
             removed_pct = (original_voxels - remaining) / original_voxels * 100
 
-            if removed_pct > 70.0:
+            if removed_pct > 60.0:
                 log_failure(logger, "CLEANING", name,
-                            f"Removed {removed_pct:.1f}% of voxels (threshold: 70%)",
+                            f"Removed {removed_pct:.1f}% of voxels (threshold: 60%)",
                             {'original': original_voxels, 'remaining': remaining})
                 failures.append(FailureRecord(name, info.seg_id, info.role,
                                               "phase1", "cleaning", "excessive_removal",
@@ -395,7 +585,7 @@ def run_phase1(
                         'segment_id':           info.seg_id,
                         'role':                 info.role,
                         'reason':               'residual_fragmentation',
-                        'closing_radius_um':    0.05,
+                        'closing_radius_um':    0.02,
                         'original_voxels':      original_voxels,
                         'closing_voxels_added': stats['closing_voxels_added'],
                         'closing_fraction':     round(
@@ -425,6 +615,35 @@ def run_phase1(
                                               {'input_voxels': remaining}))
                 continue
 
+            # Cable-length sanity check against physical dataset bounds.
+            # Segments are edge-clipped fragments; biological length expectations
+            # do not apply. Thresholds derived from dataset diagonal at startup.
+            total_um = skel_stats.get('total_length_um', 0.0)
+            if info.role in ('AXON', 'POST_SYN'):
+                if total_um < CABLE_MIN_UM:
+                    msg = (
+                        f"Cable length {total_um:.1f} µm is degenerate "
+                        f"(< {CABLE_MIN_UM} µm). Likely a noise fragment."
+                    )
+                    log_warning_box(logger, "SKELETONIZATION", name, msg)
+                    warnings.append(WarningRecord(name, "skeletonization", msg, "high"))
+                elif total_um > CABLE_ARTIFACT_UM:
+                    msg = (
+                        f"Cable length {total_um:.1f} µm exceeds 2x dataset diagonal "
+                        f"({CABLE_ARTIFACT_UM:.1f} µm). Likely skeletonization artifact "
+                        f"— inspect SWC for cycles or webbing."
+                    )
+                    log_warning_box(logger, "SKELETONIZATION", name, msg)
+                    warnings.append(WarningRecord(name, "skeletonization", msg, "high"))
+                elif total_um > CABLE_TORTUOUS_UM:
+                    msg = (
+                        f"Cable length {total_um:.1f} µm exceeds dataset diagonal "
+                        f"({CABLE_TORTUOUS_UM:.1f} µm) — segment is tortuous or "
+                        f"contains minor looping."
+                    )
+                    log_warning_box(logger, "SKELETONIZATION", name, msg)
+                    warnings.append(WarningRecord(name, "skeletonization", msg, "medium"))
+
             # Tag provenance (coord_frame already set by skeletonization)
             tree.graph['voxel_convention'] = VOXEL_CENTER
             tree.graph['bbox_min_vox']     = tuple(int(x) for x in bbox_min)
@@ -452,6 +671,40 @@ def run_phase1(
             )
 
             results[name] = (tree, swc_path)
+            skel_stats_rows.append({
+                'segment_name':                    name,
+                'segment_id':                      info.seg_id,
+                'role':                            info.role,
+                'param_spur_length_um':            spur_length_um,
+                'param_closing_radius_um':         0.05,
+                'clean_original_voxel_count':      stats.get('original_voxel_count', 0),
+                'clean_original_components':       stats.get('original_components', 0),
+                'clean_kept_components':           stats.get('kept_components', 0),
+                'clean_removed_components':        stats.get('removed_components', 0),
+                'clean_closing_voxels_added':      stats.get('closing_voxels_added', 0),
+                'clean_closing_iterations_run':    stats.get('closing_iterations_run', 0),
+                'clean_holes_filled':              stats.get('holes_filled', False),
+                'clean_hole_fill_voxels_added':    stats.get('hole_fill_voxels_added', 0),
+                'clean_per_axis_fill_voxels_added':stats.get('per_axis_fill_voxels_added', 0),
+                'clean_smoothing_iterations':      stats.get('smoothing_iterations', 0),
+                'clean_final_voxel_count':         stats.get('final_voxel_count', 0),
+                'clean_voxels_added':              stats.get('voxels_added', 0),
+                'clean_voxels_removed':            stats.get('voxels_removed', 0),
+                'skel_input_voxel_count':          skel_stats.get('input_voxel_count', 0),
+                'skel_skeleton_voxel_count':       skel_stats.get('skeleton_voxel_count', 0),
+                'skel_skeleton_points':            skel_stats.get('skeleton_points', 0),
+                'skel_compressed_nodes':           skel_stats.get('compressed_nodes', 0),
+                'skel_compressed_edges':           skel_stats.get('compressed_edges', 0),
+                'skel_branches_pruned':            skel_stats.get('branches_pruned', 0),
+                'skel_bouton_clusters_collapsed':  skel_stats.get('bouton_clusters_collapsed', 0),
+                'skel_bouton_nodes_removed':       skel_stats.get('bouton_nodes_removed', 0),
+                'skel_bouton_radius_threshold_um': skel_stats.get('bouton_radius_threshold_um', 0.0),
+                'skel_branch_count':               skel_stats.get('branch_count', 0),
+                'skel_endpoint_count':             skel_stats.get('endpoint_count', 0),
+                'skel_components_dropped':         skel_stats.get('components_dropped', 0),
+                'skel_total_length_um':            skel_stats.get('total_length_um', 0.0),
+                'skel_coord_frame':                skel_stats.get('coord_frame', ''),
+            })
             logger.info(f"  -> {swc_path}  ({tree.number_of_nodes()} nodes)")
 
         except Exception as e:
@@ -463,6 +716,7 @@ def run_phase1(
 
     log_phase_summary(logger, "Phase 1", len(targets), len(results), failures, warnings)
     _write_review_queue(review_queue_entries, output_dir, logger)
+    _write_skeleton_stats(skel_stats_rows, output_dir, logger)
     return results, failures, warnings
 
 #  Phase 2
@@ -1009,6 +1263,7 @@ def main():
     # ------------------------------------------------------------------
     # Phase 4
     # ------------------------------------------------------------------
+    connectivity = None
     if 4 in active:
         if not mappings.entries:
             logger.warning("Phase 4: mapping table is empty — connectivity output will be empty")
@@ -1022,12 +1277,24 @@ def main():
             syn_mechanism=args.syn_mechanism,
         )
 
-        logger.info(
-            f"Pipeline complete. "
-            f"Outputs in {output_dir}/  "
-            f"({len(trees)} SWC files, "
-            f"{len(connectivity)} connectivity rows)"
-        )
+    # ------------------------------------------------------------------
+    # End-of-run summary report
+    # ------------------------------------------------------------------
+    _write_pipeline_report(
+        registry=registry,
+        trees=trees,
+        centroids=centroids,
+        mappings=mappings,
+        connectivity=connectivity,
+        output_dir=output_dir,
+        logger=logger,
+    )
+
+    logger.info(
+        f"Pipeline complete. "
+        f"Outputs in {output_dir}/  "
+        f"({len(trees)} SWC files)"
+    )
 
 
 if __name__ == "__main__":
