@@ -247,6 +247,7 @@ def _write_skeleton_stats(
         'skel_skeleton_points', 'skel_compressed_nodes', 'skel_compressed_edges',
         'skel_branches_pruned', 'skel_bouton_clusters_collapsed',
         'skel_bouton_nodes_removed', 'skel_bouton_radius_threshold_um',
+        'skel_dense_clusters_collapsed',
         'skel_branch_count', 'skel_endpoint_count', 'skel_components_dropped',
         'skel_total_length_um', 'skel_coord_frame',
     ]
@@ -699,6 +700,7 @@ def run_phase1(
                 'skel_bouton_clusters_collapsed':  skel_stats.get('bouton_clusters_collapsed', 0),
                 'skel_bouton_nodes_removed':       skel_stats.get('bouton_nodes_removed', 0),
                 'skel_bouton_radius_threshold_um': skel_stats.get('bouton_radius_threshold_um', 0.0),
+                'skel_dense_clusters_collapsed':   skel_stats.get('dense_clusters_collapsed', 0),
                 'skel_branch_count':               skel_stats.get('branch_count', 0),
                 'skel_endpoint_count':             skel_stats.get('endpoint_count', 0),
                 'skel_components_dropped':         skel_stats.get('components_dropped', 0),

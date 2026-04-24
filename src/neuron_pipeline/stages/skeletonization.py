@@ -77,6 +77,7 @@ class SkeletonExtractor:
             'bouton_clusters_collapsed': 0,
             'bouton_nodes_removed': 0,
             'bouton_radius_threshold_um': 0.0,
+            'dense_clusters_collapsed': 0,
             'branch_count': 0,       # nodes with degree > 2 in pruned graph (true bifurcations)
             'endpoint_count': 0,     # nodes with degree == 1 in pruned graph
             'components_dropped': 0, # disconnected components discarded by graph_to_tree
@@ -107,6 +108,7 @@ class SkeletonExtractor:
         # voxel_size_um from extract_surfaces is (sx, sy, sz) - X first.
         # distance_transform_edt sampling must match mask axis order (Z, Y, X).
         sx, sy, sz = voxel_size_um
+        voxel_diagonal_um = float(np.sqrt(sx**2 + sy**2 + sz**2))
         dist_um = distance_transform_edt(mask.astype(bool), sampling=(sz, sy, sx))
 
         # ------------------------------------------------------------------
@@ -157,10 +159,12 @@ class SkeletonExtractor:
         # ------------------------------------------------------------------
         G_compressed, collapse_stats = self.collapse_high_radius_clusters(
             G_compressed,
+            cluster_edge_threshold_um=2.0 * voxel_diagonal_um,
         )
         stats['bouton_clusters_collapsed'] = collapse_stats['clusters_collapsed']
         stats['bouton_nodes_removed'] = collapse_stats['nodes_removed']
         stats['bouton_radius_threshold_um'] = collapse_stats['radius_threshold_um']
+        stats['dense_clusters_collapsed'] = collapse_stats.get('dense_candidates_found', 0)
 
         # ------------------------------------------------------------------
         # Step 6: Spur pruning
@@ -442,6 +446,7 @@ class SkeletonExtractor:
         G: nx.Graph,
         radius_factor: float = 2.5,
         min_cluster_nodes: int = 3,
+        cluster_edge_threshold_um: float = 0.0,
     ) -> Tuple[nx.Graph, Dict[str, Any]]:
         """
         Collapse dense node clusters caused by bouton swellings.
@@ -482,6 +487,7 @@ class SkeletonExtractor:
             'clusters_found': 0,
             'clusters_collapsed': 0,
             'nodes_removed': 0,
+            'dense_candidates_found': 0,
         }
 
         if G.number_of_nodes() < min_cluster_nodes:
@@ -498,17 +504,41 @@ class SkeletonExtractor:
         )
 
         # --- Identify candidates -----------------------------------------------
-        candidates = [n for n in G.nodes() if G.nodes[n]['radius'] > radius_threshold]
+        # Criterion 1: high-radius nodes (bouton swelling medial surface)
+        radius_cand_set = set(n for n in G.nodes() if G.nodes[n]['radius'] > radius_threshold)
+
+        # Criterion 2: dense-edge nodes (web/mesh artifact in flat/thick regions).
+        # A node qualifies if ALL its edges are shorter than the voxel-diagonal-derived
+        # threshold, meaning it lives entirely within a locally dense subgraph.
+        n_dense = 0
+        if cluster_edge_threshold_um > 0:
+            dense_cand_set = set(
+                n for n in G.nodes()
+                if G.degree(n) >= 2
+                and all(G[n][nb]['length'] < cluster_edge_threshold_um for nb in G.neighbors(n))
+            )
+            n_dense = len(dense_cand_set - radius_cand_set)
+            if n_dense > 0:
+                self.logger.info(
+                    f"Bouton collapse: {n_dense} additional dense-edge candidates "
+                    f"(edge_threshold={cluster_edge_threshold_um:.4f} um)"
+                )
+        else:
+            dense_cand_set = set()
+
+        candidates = list(radius_cand_set | dense_cand_set)
 
         if not candidates:
-            self.logger.info("Bouton collapse: no nodes above threshold -- skipping")
+            self.logger.info("Bouton collapse: no nodes meet either threshold -- skipping")
             zero_stats['median_radius_um'] = median_radius
             zero_stats['radius_threshold_um'] = radius_threshold
             return G.copy(), zero_stats
 
-        if len(candidates) == G.number_of_nodes():
+        # Guard: skip only when ALL nodes are radius candidates with no dense candidates.
+        # A complete-web case (all dense) should still be collapsed, not skipped.
+        if not dense_cand_set and len(radius_cand_set) == G.number_of_nodes():
             self.logger.warning(
-                f"Bouton collapse: all {G.number_of_nodes()} nodes above threshold "
+                f"Bouton collapse: all {G.number_of_nodes()} nodes above radius threshold "
                 "-- skipping (segment may be uniformly large)"
             )
             zero_stats['median_radius_um'] = median_radius
@@ -536,13 +566,13 @@ class SkeletonExtractor:
                 parent[ra] = rb
 
         # Find candidate pairs within max possible radius
-        max_radius = float(cand_radii.max())
+        max_radius = max(float(cand_radii.max()), cluster_edge_threshold_um)
         kd = KDTree(cand_pos)
         pairs = kd.query_pairs(r=max_radius)
 
         for i, j in pairs:
             dist = float(np.linalg.norm(cand_pos[i] - cand_pos[j]))
-            link_threshold = max(cand_radii[i], cand_radii[j])
+            link_threshold = max(cand_radii[i], cand_radii[j], cluster_edge_threshold_um)
             if dist < link_threshold:
                 _union(i, j)
 
@@ -684,6 +714,7 @@ class SkeletonExtractor:
             'clusters_found': len(all_clusters),
             'clusters_collapsed': len(clusters),
             'nodes_removed': nodes_removed,
+            'dense_candidates_found': n_dense,
         }
         return G_out, collapse_stats
 
