@@ -9,7 +9,7 @@ def extract_surface(extractor, segment_id):
     vertices, faces, output_path = extractor.extract_segment(
         segment_id=segment_id,
         miplevel=0,
-        close_surfaces=False,
+        close_surfaces=True,
         output_format='obj'
     )
     if vertices is not None and faces is not None:

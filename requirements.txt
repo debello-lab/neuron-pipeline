@@ -11,3 +11,4 @@ numpy
 scipy
 scikit-image
 networkx
+kimimaro

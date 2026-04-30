@@ -12,7 +12,7 @@ from neuron_pipeline.stages.skeletonization import SkeletonExtractor, SWCWriter
 SEGMENT_ID   = int(sys.argv[1]) if len(sys.argv) > 1 else 1
 MIPLEVEL     = 1        # 0 = full resolution, 1 = half resolution
 PADDING      = 2        # extra voxels around bounding box
-SPUR_UM      = 0.5      # prune leaf branches shorter than this (micrometers)
+SPUR_UM      = 0    # prune leaf branches shorter than this (micrometers)
 OUTPUT_DIR   = Path(__file__).parent.parent / "diag_output"
 
 logging.basicConfig(
@@ -59,11 +59,12 @@ def main() -> None:
     # 1B. Cleaning -- first pass to count components
     cleaned, stats = cleaner.clean_mask(
         mask,
-        closing_radius_um=1.2,
+        closing_radius_um=0.05,
         keep_largest_only=True,
         fill_holes=True,
         smooth_iterations=0,
         voxel_size_um=voxel_size,
+        bbox_min_vox=bbox_min,
     )
 
     if stats['original_components'] > 1:
@@ -75,10 +76,11 @@ def main() -> None:
         # Re-clean keeping only the largest component
         cleaned, stats = cleaner.clean_mask(
             cleaned.mask,
-            closing_radius_um=1.2,
+            closing_radius_um=0.05,
             keep_largest_only=False,
             fill_holes=False,
-            smooth_iterations=0,
+            smooth_iterations=2,
+            bbox_min_vox=bbox_min,
             voxel_size_um=voxel_size,
         )
 
@@ -105,13 +107,41 @@ def main() -> None:
             'bbox_min_vox': str(bbox_min),      # (minx, miny, minz) in voxels
             'voxel_size_um': str(voxel_size),   # (sx, sy, sz) in µm
             'coord_frame': 'physical_um_xyz',
-            'compressed_nodes': skel_stats.get('compressed_nodes'),
+            'skeleton_vertices': skel_stats.get('skeleton_vertices'),
+            'skeleton_edges': skel_stats.get('skeleton_edges'),
             'spurs_pruned': skel_stats.get('branches_pruned'),
             'total_length_um': f"{skel_stats.get('total_length_um', 0):.2f}",
         },
     )
 
     log.info(f"-> {swc_path}  ({tree.number_of_nodes()} nodes)")
+
+    # 1E. Extract and save surface mesh as OBJ
+    log.info(f"Extracting surface mesh for segment {SEGMENT_ID}...")
+    METADATA = extractor.get_segment_metadata(SEGMENT_ID)
+    if not METADATA:
+        log.error(f"Failed to retrieve metadata for segment {SEGMENT_ID}")
+        return
+    vertices, faces = extractor._extract_full_volume(
+                    SEGMENT_ID, 
+                    METADATA, 
+                    MIPLEVEL, 
+                    close_surfaces=True
+                )
+    if vertices is None or faces is None:
+        log.error(f"Surface mesh extraction failed for segment {SEGMENT_ID}")
+        return
+    obj_path = extractor._save_mesh(
+                vertices, 
+                faces, 
+                METADATA, 
+                output_format='obj', 
+                custom_filename=f'cell_{name}'
+            )
+    if obj_path:
+        log.info(f"-> {obj_path}")
+    else:
+        log.warning(f"Surface mesh extraction failed for segment {SEGMENT_ID}")
 
 
 if __name__ == "__main__":
