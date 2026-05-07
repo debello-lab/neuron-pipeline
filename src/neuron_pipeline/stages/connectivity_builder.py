@@ -459,6 +459,64 @@ class ConnectivityBuilder:
             f"Arbor recipe: {len(cell_labels)} cells, "
             f"{len(synapses)} synapses, {len(contacts)} contacts"
         )
+    
+    def generate_arbor_recipe(
+    self,
+    registry: SegmentRegistry,
+    trees: Dict[str, Tuple[nx.DiGraph, str]],
+    output_path: str
+    ) -> dict:
+        """
+        Generate Arbor-compatible recipe JSON.
+        
+        Uses connectivity from registry, doesn't require cable mappings.
+        """
+        recipe = {
+            "cells": [],
+            "connections": []
+        }
+        
+        # Add cells (all AXON and POST_SYN that have trees)
+        gid_map = {}  # name -> gid
+        gid = 0
+        
+        for name in sorted(trees.keys()):
+            info = registry.segments.get(name)
+            if not info:
+                continue
+            
+            tree, swc_path = trees[name]
+            
+            recipe["cells"].append({
+                "gid": gid,
+                "name": name,
+                "role": info.role,
+                "swc_file": swc_path,
+            })
+            
+            gid_map[name] = gid
+            gid += 1
+        
+        # Add connections from connectivity table
+        for row in registry.connectivity:
+            if row.axon_name not in gid_map or row.post_syn_name not in gid_map:
+                continue  # Skip if either cell missing
+            
+            recipe["connections"].append({
+                "source_gid": gid_map[row.axon_name],
+                "target_gid": gid_map[row.post_syn_name],
+                "source_label": "axon",
+                "target_label": "dendrite",
+                "synapse_name": row.synapse_name,
+                "weight": 1.0,
+                "delay": 0.5,  # ms
+            })
+        
+        # Write JSON
+        with open(output_path, 'w') as f:
+            json.dump(recipe, f, indent=2)
+        
+        return recipe
 
     # ------------------------------------------------------------------
     # Analysis

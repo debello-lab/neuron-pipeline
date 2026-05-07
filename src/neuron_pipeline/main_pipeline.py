@@ -663,7 +663,8 @@ def run_phase1(
                     'bbox_min_vox': str(bbox_min),      # (minx, miny, minz) in voxels
                     'voxel_size_um': str(voxel_size),   # (sx, sy, sz) in µm
                     'coord_frame': COORD_FRAME_PHYSICAL,
-                    'compressed_nodes': skel_stats.get('compressed_nodes'),
+                    'skeleton_vertices': skel_stats.get('skeleton_vertices'),
+                    'skeleton_edges': skel_stats.get('skeleton_edges'),
                     'bouton_clusters_collapsed': skel_stats.get('bouton_clusters_collapsed', 0),
                     'bouton_nodes_removed': skel_stats.get('bouton_nodes_removed', 0),
                     'spurs_pruned': skel_stats.get('branches_pruned'),
