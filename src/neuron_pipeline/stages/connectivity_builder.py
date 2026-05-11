@@ -9,7 +9,7 @@ Consumes outputs from all previous phases and produces two deliverables:
    contact (CONTACT segments).  Columns give both the presynaptic (axon)
    and postsynaptic (POST_SYN) cable locations in Arbor-addressable form:
 
-       pre_cell, pre_swc, pre_edge_u, pre_edge_v, pre_arc_frac,
+       pre_cell,  pre_swc,  pre_edge_u,  pre_edge_v,  pre_arc_frac,
        post_cell, post_swc, post_edge_u, post_edge_v, post_arc_frac,
        synapse_name, synapse_seg_id,
        bouton_name,  bouton_seg_id,

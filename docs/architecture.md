@@ -332,7 +332,7 @@ Segments where automated cleaning produced suspicious metrics and warrant human 
 | `components_after_clean` | Number of connected components remaining after cleaning |
 | `recommended_action` | Suggested diagnostic command |
 
-Use `diag_cleaning_param_sweep.py` with the suggested command to inspect flagged segments.
+
 
 ---
 

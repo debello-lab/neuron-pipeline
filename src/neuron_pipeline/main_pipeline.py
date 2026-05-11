@@ -186,7 +186,6 @@ def _write_review_queue(
     residual fragmentation (multiple components remained after cleaning).
 
     The file appends on re-runs so successive pipeline runs accumulate the queue.
-    Use diag_cleaning_param_sweep.py to inspect flagged segments individually.
     """
     import csv as _csv
 
@@ -516,7 +515,6 @@ def run_phase1(
                     f"Closing added {closing_fraction*100:.1f}% of original volume "
                     f"({stats['closing_voxels_added']:,} vox). "
                     f"Closing radius may be too large or segment has large surface gaps. "
-                    f"Run: diag_cleaning_param_sweep.py --segment {info.seg_id} --z-slab 20 --no-obj"
                 )
                 log_warning_box(logger, "CLEANING", name, msg)
                 warnings.append(WarningRecord(name, "cleaning", msg, "medium"))
@@ -530,10 +528,6 @@ def run_phase1(
                     'closing_voxels_added': stats['closing_voxels_added'],
                     'closing_fraction':     round(closing_fraction, 4),
                     'components_after_clean': stats['original_components'],
-                    'recommended_action':   (
-                        f"diag_cleaning_param_sweep.py --segment {info.seg_id} "
-                        f"--z-slab 20 --no-obj"
-                    ),
                 })
 
             if stats['original_components'] > 1:
@@ -593,10 +587,6 @@ def run_phase1(
                             stats['closing_voxels_added'] / max(original_voxels, 1), 4
                         ),
                         'components_after_clean': n_comp,
-                        'recommended_action':   (
-                            f"diag_cleaning_param_sweep.py --segment {info.seg_id} "
-                            f"--z-slab 20 --no-obj"
-                        ),
                     })
 
             # 1C. Skeletonize voxels (includes compression, pruning, soma insertion)

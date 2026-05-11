@@ -211,8 +211,6 @@ class VoxelCleaner:
       keep_largest_only = True
       fill_holes        = True
 
-    Run diag_cleaning_param_sweep.py to validate the chosen radius against
-    your specific segment types before committing to a value.
     """
 
     def __init__(self, logger: Optional[logging.Logger] = None):
@@ -262,7 +260,6 @@ class VoxelCleaner:
                                    covers the typical gap range of 0.6-1.1 µm
                                    from incomplete boundary mask fills.  Increase
                                    to ~1.5 µm for the occasional ~2 µm gap.
-                                   Use diag_cleaning_param_sweep.py to tune.
             closing_iterations   : Number of closing passes to apply.  A single
                                    pass bridges gaps up to ~radius_um.  Multiple
                                    passes with the same element progressively
