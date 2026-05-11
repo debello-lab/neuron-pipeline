@@ -12,7 +12,7 @@ from neuron_pipeline.stages.skeletonization import SkeletonExtractor, SWCWriter
 SEGMENT_ID   = int(sys.argv[1]) if len(sys.argv) > 1 else 1
 MIPLEVEL     = 1        # 0 = full resolution, 1 = half resolution
 PADDING      = 2        # extra voxels around bounding box
-SPUR_UM      = 0    # prune leaf branches shorter than this (micrometers)
+SPUR_UM      = 2    # prune leaf branches shorter than this (micrometers)
 OUTPUT_DIR   = Path(__file__).parent.parent / "diag_output"
 
 logging.basicConfig(
@@ -59,7 +59,7 @@ def main() -> None:
     # 1B. Cleaning -- first pass to count components
     cleaned, stats = cleaner.clean_mask(
         mask,
-        closing_radius_um=0.05,
+        closing_radius_um=0.05, # 50nm
         keep_largest_only=True,
         fill_holes=True,
         smooth_iterations=0,
@@ -79,7 +79,7 @@ def main() -> None:
             closing_radius_um=0.05,
             keep_largest_only=False,
             fill_holes=False,
-            smooth_iterations=2,
+            smooth_iterations=0,
             bbox_min_vox=bbox_min,
             voxel_size_um=voxel_size,
         )
