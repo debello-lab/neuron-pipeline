@@ -18,7 +18,7 @@ This separation makes `vastpy` independently reusable for other researchers whil
 - Convert exported data into structures usable by downstream tools and workflows:
   - skeleton graphs and SWC morphologies
   - marker/centroid tables for boutons/synapses/contacts
-  - (planned) mapping markers to SWC nodes for annotation/connectivity analyses
+  - mapping markers to SWC nodes for annotation/connectivity analyses
 - Provide a workflow that reduces reliance on GUI/manual steps and minimizes MATLAB dependence.
 
 ### Constraints / assumptions
@@ -87,8 +87,6 @@ ms-neuron-pipeline/
     - Write Arbor-ready network recipe (JSON) and a human-readable connectivity report.
     - Output: `connectivity.csv`, `connectivity_summary.csv`, `connectivity_report.txt`, `arbor_recipe.json`.
 
-6. **Phase 5 -- Arbor Integration (planned)**
-    - Validate simulation runs against the generated recipe.
 
 The main artifacts written to disk are under `./vast_export/`:
 
@@ -168,12 +166,15 @@ Improves voxel representations before skeletonization/centroid computation. Can 
 Converts a cleaned voxel mask to a skeleton representation and save it in SWC format.
 
 **Responsibilities:**
-- Skeletonize 3D voxel masks (Lee method).
-- Represent the skeleton as a graph (typically voxel-adjacency-based) internally.
-- Convert graph to an SWC tree:
-  - ensure a single root
-  - maintain parent-child structure
-  - assign node coordinates and radii 
+- Skeletonize 3D voxel masks using TEASAR via kimimaro, with an explicit anisotropy parameter to handle the 5× Z anisotropy of the dataset.
+- Estimate node radii from `scipy.ndimage.distance_transform_edt`.
+- Collapse bouton swelling node clusters (`collapse_high_radius_clusters`).
+- Prune short leaf branches below `spur_length_um`.
+- Convert the compressed graph to an SWC tree:
+  - ensure a single root (chosen as the endpoint at one end of the graph diameter)
+  - maintain parent-child structure via BFS traversal
+  - insert a synthetic soma sample for Arbor compatibility
+  - assign node coordinates in physical µm and radii
 - Write SWC to disk.
 
 **Important constraint:** coordinate conventions must match those used by centroid extraction (see coordinate section below).
@@ -328,7 +329,7 @@ Segments where automated cleaning produced suspicious metrics and warrant human 
 | `closing_radius_um` | Closing radius applied |
 | `original_voxels` | Voxel count before cleaning |
 | `closing_voxels_added` | Voxels added by morphological closing |
-| `closing_fraction` | `closing_voxels_added / original_voxels`; values > 0.20 trigger a flag |
+| `closing_fraction` | `closing_voxels_added / original_voxels`; values > 0.70 trigger a flag |
 | `components_after_clean` | Number of connected components remaining after cleaning |
 | `recommended_action` | Suggested diagnostic command |
 
@@ -344,11 +345,17 @@ This pipeline combines multiple coordinate spaces:
 2. **Global voxel indices** (offset by the segment's bounding box minimum in the full volume)
 3. **World units** (voxel index × voxel_size in microns)
 
-Key requirements:
-- All phases must use the same convention for converting voxel indices to physical coordinates.
-- If a voxel-center convention is used (e.g., +0.5 offset), it must be consistent across SWC writing and centroid extraction.
+All coordinates in output files use the **voxel-center convention** in physical µm, XYZ order:
 
-A mismatch of even half a voxel is usually small in absolute terms, but consistency is important for mapping markers to morphologies.
+```
+world = (local_vox + 0.5 + bbox_min_vox) × voxel_size
+```
+
+where `bbox_min_vox` is the bounding-box origin in voxel units and `voxel_size` converts to µm.
+
+Consistency is maintained at two levels:
+- Each stage independently applies the same formula.
+- Phase 1 stamps `coord_frame = 'physical_um_xyz_center'` on every skeleton tree; Phase 3 asserts this tag matches the Phase 2 centroid table before building KD-trees. A mismatch raises a `ValueError` rather than silently corrupting arc-fraction output.
 
 ---
 

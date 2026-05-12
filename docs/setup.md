@@ -46,6 +46,8 @@ ms-neuron-pipeline/
       main_pipeline.py
       stages/
         centroid_extraction.py
+        centroid_mapper.py
+        connectivity_builder.py
         extract_surfaces.py
         segment_classifier.py
         skeletonization.py
@@ -58,36 +60,41 @@ ms-neuron-pipeline/
         exporting.py
 ```
 
-## 1) Create and activate a virtual environment
+## 1) Install (recommended)
+
+From the repository root:
+
+```bat
+install.bat
+```
+
+This script checks for Python 3.10+, creates `.venv`, installs all dependencies from `requirements.txt`, and installs `neuron_pipeline` and `vastpy` in editable mode.
+
+To activate the environment in a new terminal:
+
+```bat
+.venv\Scripts\activate
+```
+
+## 1b) Manual install (alternative)
+
 ### Windows PowerShell
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m pip install -e .
 ```
 
 ### Windows CMD
-```bash
+```cmd
 python -m venv .venv
 .\.venv\Scripts\activate
-```
-After activation, confirm Python is using the virtual environment:
-
-```bat
-python -V
-where python
-```
-
-## 2) Install the project in editable mode
-
-From the repository root:
-```
 python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 python -m pip install -e .
 ```
-Editable install is recommended because:
-- the project uses a src/ layout
-- it allows imports like from neuron_pipeline.main_pipeline import main
-- it lets you edit source files without reinstalling each time
 
 ## 3) Verify package imports
 
@@ -128,38 +135,53 @@ This project does not launch VAST Lite automatically. VAST must already be runni
 
 ## 5) Run the pipeline
 
-From the repository root:
 ```bat
-python .\scripts\run_pipeline.py
+scripts\run_pipeline.bat
 ```
 
-This script should call:
-```python
-from neuron_pipeline.main_pipeline import main
+Or directly:
 
-if __name__ == "__main__":
-    main()
+```
+python -m neuron_pipeline.main_pipeline [OPTIONS]
+```
+
+Common flags:
+
+| Flag | Description |
+|------|-------------|
+| `--phases 1` | Run only Phase 1 |
+| `--from-phase 2` | Resume from Phase 2 using existing Phase 1 outputs |
+| `--segment A1 A2` | Process only named segments |
+| `--spur-length-um 2.0` | Spur pruning threshold (µm) |
+| `--resume` | Skip segments that already have a `.swc` on disk |
+| `--output-dir ./vast_export` | Output directory |
+
+Single-segment diagnostic:
+
+```
+python "diagnostic scripts/test.py" <segment_id>
 ```
 
 ## 6) Expected outputs
 
 By default, the pipeline writes outputs under: `vast_export/`
 
-Typical output folders/files include:
 ```
 vast_export/
-  logs/
-  meshes/
-  swc/
-  voxels/
-  centroids.csv
+├── swc/                        SWC skeleton files (cell_<name>.swc)
+├── stats/
+│   └── skeleton_stats.csv      Per-segment skeletonization metrics
+├── centroids.csv               Bouton / synapse / contact centroids
+├── cable_mappings.csv          Centroid-to-skeleton cable locations
+├── connectivity.csv            Full pre/post synaptic edge list
+├── connectivity_summary.csv    Per axon–POST_SYN pair statistics
+├── connectivity_report.txt     Plain-text connectivity report with QC flags
+├── arbor_recipe.json           Arbor-ready network description
+├── review_queue.csv            Segments flagged for manual inspection
+├── pipeline_report.txt         Single-page run summary
+└── logs/
+    └── pipeline_<timestamp>.log
 ```
-These outputs may include:
-- exported voxel masks
-- exported meshes
-- generated SWC files
-- centroid tables for boutons/synapses/contacts
-- logs or debug artifacts
 
 ## Common problems
 **No module named neuron_pipeline**
@@ -258,13 +280,10 @@ vast_export/
 
 ## Quick setup checklist
 
-Use this as a minimal setup checklist:
-
 - Clone the repository
-- Create and activate .venv
-- Run python -m pip install -e .
-- Confirm import neuron_pipeline works
-- Open VAST Lite
-- Load the correct project/segmentation
-- Run python .\scripts\run_pipeline.py
-- Confirm outputs appear under vast_export/
+- Run `install.bat`
+- Activate `.venv\Scripts\activate` in any new terminal
+- Confirm `python -c "import neuron_pipeline; import vastpy; print('OK')"` passes
+- Open VAST Lite and load the target segmentation
+- Run `scripts\run_pipeline.bat`
+- Confirm outputs appear under `vast_export/`
