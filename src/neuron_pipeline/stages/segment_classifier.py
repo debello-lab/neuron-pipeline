@@ -54,7 +54,9 @@ class SegmentClassifier:
         }
 
     def classify_segments(self) -> SegmentRegistry:
-        """Classify all VAST segments and build connectivity / contact tables.
+        """
+        Classify all VAST segments and build connectivity / contact tables.
+        No extraction or surface processing, just classification based on names and hierarchy.
 
         Returns:
             SegmentRegistry with classified segments, wiring rows, contact rows,

@@ -9,7 +9,7 @@ Consumes outputs from all previous phases and produces two deliverables:
    contact (CONTACT segments).  Columns give both the presynaptic (axon)
    and postsynaptic (POST_SYN) cable locations in Arbor-addressable form:
 
-       pre_cell, pre_swc, pre_edge_u, pre_edge_v, pre_arc_frac,
+       pre_cell,  pre_swc,  pre_edge_u,  pre_edge_v,  pre_arc_frac,
        post_cell, post_swc, post_edge_u, post_edge_v, post_arc_frac,
        synapse_name, synapse_seg_id,
        bouton_name,  bouton_seg_id,
@@ -30,7 +30,10 @@ Consumes outputs from all previous phases and produces two deliverables:
 import csv
 import json
 import logging
+import statistics
+from collections import defaultdict
 from dataclasses import dataclass, field, asdict
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -58,7 +61,7 @@ class SynapseRow:
     pre_nearest_z_um: float
     distance_pre_um: float
 
-    # Postsynaptic side (POST_SYN cell) — empty string / -1 for contacts
+    # Postsynaptic side (POST_SYN cell) -- empty string / -1 for contacts
     post_cell: str
     post_swc: str
     post_edge_u: int
@@ -74,6 +77,14 @@ class SynapseRow:
     synapse_seg_id: int
     bouton_name: str
     bouton_seg_id: int
+
+    # QC and SWC row IDs (from Phase 3 CableMappingEntry)
+    pre_qc_flag:  str           = 'ok'
+    pre_swc_u:    Optional[int] = None   # SWC row ID of pre_edge_u node
+    pre_swc_v:    Optional[int] = None   # SWC row ID of pre_edge_v node
+    post_qc_flag: str           = 'ok'
+    post_swc_u:   Optional[int] = None   # SWC row ID of post_edge_u node
+    post_swc_v:   Optional[int] = None   # SWC row ID of post_edge_v node
 
 
 @dataclass
@@ -122,15 +133,15 @@ class ConnectivityBuilder:
     Synapse resolution
     ------------------
     Each SYNAPSE segment (A1B2P1S1) defines a confirmed connection:
-      - presynaptic  location → cable mapping of the parent BOUTON  (A1B2)
-      - postsynaptic location → cable mapping of the parent POST_SYN (A1B2P1)
+      - presynaptic  location -> cable mapping of the parent BOUTON  (A1B2)
+      - postsynaptic location -> cable mapping of the parent POST_SYN (A1B2P1)
 
     Contact resolution
     ------------------
     Each CONTACT segment (A1B2X1) defines a potential (unconfirmed) contact:
-      - presynaptic  location → cable mapping of the parent BOUTON  (A1B2)
-      - postsynaptic location → not available (no POST_SYN defined)
-        → post_* fields are left as empty / -1
+      - presynaptic  location -> cable mapping of the parent BOUTON  (A1B2)
+      - postsynaptic location -> not available (no POST_SYN defined)
+        -> post_* fields are left as empty / -1
 
     Both are written to connectivity.csv; contacts are flagged in the
     connection_type column and omitted from the Arbor synapses list
@@ -157,8 +168,8 @@ class ConnectivityBuilder:
 
         Args:
             registry      : SegmentRegistry from Phase 0.
-            trees         : Phase 1 output — cell_name -> (tree, swc_path).
-            mapping_table : Phase 3 output — CableMappingTable.
+            trees         : Phase 1 output -- cell_name -> (tree, swc_path).
+            mapping_table : Phase 3 output -- CableMappingTable.
             output_dir    : Base directory; files written here.
             syn_mechanism : Arbor mechanism name for confirmed synapses.
 
@@ -239,7 +250,7 @@ class ConnectivityBuilder:
         if bouton_map is None:
             self.logger.debug(
                 f"  SYNAPSE {conn_row.synapse_name}: no cable mapping for "
-                f"BOUTON {conn_row.bouton_name} — skipped"
+                f"BOUTON {conn_row.bouton_name} -- skipped"
             )
             return None
 
@@ -295,6 +306,12 @@ class ConnectivityBuilder:
             synapse_seg_id=conn_row.synapse_seg_id,
             bouton_name=conn_row.bouton_name,
             bouton_seg_id=conn_row.bouton_seg_id,
+            pre_qc_flag=getattr(bouton_map,   'qc_distance_flag', 'ok'),
+            pre_swc_u=getattr(bouton_map,     'swc_node_u', None),
+            pre_swc_v=getattr(bouton_map,     'swc_node_v', None),
+            post_qc_flag=getattr(post_syn_map, 'qc_distance_flag', 'ok') if post_syn_map else 'ok',
+            post_swc_u=getattr(post_syn_map,   'swc_node_u', None)       if post_syn_map else None,
+            post_swc_v=getattr(post_syn_map,   'swc_node_v', None)       if post_syn_map else None,
         )
 
     def _build_contact_row(
@@ -310,7 +327,7 @@ class ConnectivityBuilder:
         if bouton_map is None:
             self.logger.debug(
                 f"  CONTACT {contact_row.contact_name}: no cable mapping for "
-                f"BOUTON {contact_row.bouton_name} — skipped"
+                f"BOUTON {contact_row.bouton_name} -- skipped"
             )
             return None
 
@@ -338,6 +355,9 @@ class ConnectivityBuilder:
             synapse_seg_id=contact_row.contact_seg_id,
             bouton_name=contact_row.bouton_name,
             bouton_seg_id=contact_row.bouton_seg_id,
+            pre_qc_flag=getattr(bouton_map, 'qc_distance_flag', 'ok'),
+            pre_swc_u=getattr(bouton_map,   'swc_node_u', None),
+            pre_swc_v=getattr(bouton_map,   'swc_node_v', None),
         )
 
     # ------------------------------------------------------------------
@@ -420,6 +440,12 @@ class ConnectivityBuilder:
                 })
 
         recipe = {
+            "metadata": {
+                "coord_frame": "physical_um_xyz_center",
+                # branch/pos locations use graph node IDs, not SWC row IDs.
+                # pre_swc_u/v in connectivity.csv holds the SWC row IDs if needed.
+                "branch_id_convention": "graph_node_id",
+            },
             "cell_labels": cell_labels,
             "synapses":    synapses,
             "contacts":    contacts,
@@ -433,3 +459,217 @@ class ConnectivityBuilder:
             f"Arbor recipe: {len(cell_labels)} cells, "
             f"{len(synapses)} synapses, {len(contacts)} contacts"
         )
+    
+    def generate_arbor_recipe(
+    self,
+    registry: SegmentRegistry,
+    trees: Dict[str, Tuple[nx.DiGraph, str]],
+    output_path: str
+    ) -> dict:
+        """
+        Generate Arbor-compatible recipe JSON.
+        
+        Uses connectivity from registry, doesn't require cable mappings.
+        """
+        recipe = {
+            "cells": [],
+            "connections": []
+        }
+        
+        # Add cells (all AXON and POST_SYN that have trees)
+        gid_map = {}  # name -> gid
+        gid = 0
+        
+        for name in sorted(trees.keys()):
+            info = registry.segments.get(name)
+            if not info:
+                continue
+            
+            tree, swc_path = trees[name]
+            
+            recipe["cells"].append({
+                "gid": gid,
+                "name": name,
+                "role": info.role,
+                "swc_file": swc_path,
+            })
+            
+            gid_map[name] = gid
+            gid += 1
+        
+        # Add connections from connectivity table
+        for row in registry.connectivity:
+            if row.axon_name not in gid_map or row.post_syn_name not in gid_map:
+                continue  # Skip if either cell missing
+            
+            recipe["connections"].append({
+                "source_gid": gid_map[row.axon_name],
+                "target_gid": gid_map[row.post_syn_name],
+                "source_label": "axon",
+                "target_label": "dendrite",
+                "synapse_name": row.synapse_name,
+                "weight": 1.0,
+                "delay": 0.5,  # ms
+            })
+        
+        # Write JSON
+        with open(output_path, 'w') as f:
+            json.dump(recipe, f, indent=2)
+        
+        return recipe
+
+    # ------------------------------------------------------------------
+    # Analysis
+    # ------------------------------------------------------------------
+
+    def write_analysis(
+        self,
+        connectivity: ConnectivityOutput,
+        registry: SegmentRegistry,
+        trees: Dict[str, Tuple],
+        output_dir: str = "./vast_export",
+    ) -> Tuple[str, str]:
+        """
+        Write connectivity_summary.csv and connectivity_report.txt.
+
+        Summary CSV: one row per (axon, post_syn) pair -- synapse counts,
+        distance stats, and QC flag tallies.
+
+        Report: plain-text with segment inventory, per-pair breakdown,
+        missing connections, and QC warnings.
+
+        Returns (summary_csv_path, report_txt_path).
+        """
+        out = Path(output_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        summary_path = str(out / "connectivity_summary.csv")
+        report_path  = str(out / "connectivity_report.txt")
+
+        syn_rows = [r for r in connectivity.rows if r.connection_type == "synapse"]
+        con_rows = [r for r in connectivity.rows if r.connection_type == "contact"]
+
+        # Group synapses by (pre_cell, post_cell)
+        pairs: Dict[Tuple[str, str], List[SynapseRow]] = defaultdict(list)
+        for row in syn_rows:
+            pairs[(row.pre_cell, row.post_cell)].append(row)
+
+        # --- summary CSV ---
+        summary = []
+        for (axon, post_syn), rows in sorted(pairs.items()):
+            pre_dists  = [r.distance_pre_um for r in rows]
+            post_dists = [r.distance_post_um for r in rows if r.distance_post_um >= 0]
+            qc_pre  = {k: sum(1 for r in rows if r.pre_qc_flag  == k)
+                       for k in ('ok', 'warn', 'suspicious')}
+            qc_post = {k: sum(1 for r in rows if r.post_qc_flag == k)
+                       for k in ('ok', 'warn', 'suspicious')}
+            summary.append({
+                'axon':               axon,
+                'post_syn':           post_syn,
+                'n_synapses':         len(rows),
+                'bouton_names':       ';'.join(sorted({r.bouton_name for r in rows})),
+                'synapse_names':      ';'.join(sorted(r.synapse_name for r in rows)),
+                'pre_dist_mean_um':   f"{statistics.mean(pre_dists):.3f}",
+                'pre_dist_min_um':    f"{min(pre_dists):.3f}",
+                'pre_dist_max_um':    f"{max(pre_dists):.3f}",
+                'post_dist_mean_um':  f"{statistics.mean(post_dists):.3f}" if post_dists else 'n/a',
+                'post_dist_min_um':   f"{min(post_dists):.3f}"              if post_dists else 'n/a',
+                'post_dist_max_um':   f"{max(post_dists):.3f}"              if post_dists else 'n/a',
+                'pre_qc_ok':          qc_pre['ok'],
+                'pre_qc_warn':        qc_pre['warn'],
+                'pre_qc_suspicious':  qc_pre['suspicious'],
+                'post_qc_ok':         qc_post['ok'],
+                'post_qc_warn':       qc_post['warn'],
+                'post_qc_suspicious': qc_post['suspicious'],
+            })
+
+        if summary:
+            with open(summary_path, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=list(summary[0].keys()))
+                writer.writeheader()
+                writer.writerows(summary)
+        else:
+            Path(summary_path).write_text("")
+
+        # --- detect missing connections ---
+        mapped_syn  = {r.synapse_name for r in syn_rows}
+        mapped_con  = {r.synapse_name for r in con_rows}   # contact_name stored here
+        missing_syn = [r for r in registry.connectivity if r.synapse_name  not in mapped_syn]
+        missing_con = [r for r in registry.contacts     if r.contact_name  not in mapped_con]
+
+        # --- text report ---
+        W = 60
+        L: List[str] = []
+        L.append("=" * W)
+        L.append("CONNECTIVITY ANALYSIS REPORT")
+        L.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        L.append("=" * W)
+
+        def section(title: str) -> None:
+            L.extend(["", title, "-" * W])
+
+        section("SEGMENT INVENTORY")
+        role_counts: Dict[str, int] = defaultdict(int)
+        for info in registry.segments.values():
+            role_counts[info.role] += 1
+        for role in ('AXON', 'BOUTON', 'POST_SYN', 'SYNAPSE', 'CONTACT'):
+            L.append(f"  {role:<12}: {role_counts.get(role, 0)}")
+        L.append(f"  {'Trees OK':<12}: {len(trees)}")
+
+        section("SYNAPSES")
+        L.append(f"  Confirmed synapses : {len(syn_rows)}")
+        L.append(f"  Axon->PostSyn pairs: {len(pairs)}")
+        for (axon, post_syn), rows in sorted(pairs.items()):
+            n_susp = sum(1 for r in rows if r.pre_qc_flag == 'suspicious')
+            qc_tag = f"  [{n_susp}/{len(rows)} pre suspicious]" if n_susp else ""
+            L.append(
+                f"\n  {axon} -> {post_syn}  "
+                f"({len(rows)} synapse{'s' if len(rows) > 1 else ''}){qc_tag}"
+            )
+            for r in sorted(rows, key=lambda x: x.synapse_name):
+                L.append(
+                    f"    {r.synapse_name:<18}"
+                    f"  pre {r.distance_pre_um:.2f} um [{r.pre_qc_flag}]"
+                    f"  post {r.distance_post_um:.2f} um [{r.post_qc_flag}]"
+                )
+
+        section("CONTACTS (unconfirmed)")
+        L.append(f"  Putative contacts: {len(con_rows)}")
+        for r in con_rows:
+            L.append(
+                f"  {r.synapse_name}  axon={r.pre_cell}  bouton={r.bouton_name}"
+                f"  pre {r.distance_pre_um:.2f} um [{r.pre_qc_flag}]"
+            )
+
+        section("MISSING CONNECTIONS")
+        if not missing_syn and not missing_con:
+            L.append("  All expected connections resolved successfully.")
+        for row in missing_syn:
+            L.append(f"  SYNAPSE {row.synapse_name}  ({row.axon_name} -> {row.post_syn_name})")
+            if row.axon_name    not in trees:
+                L.append(f"    axon skeleton '{row.axon_name}' failed in Phase 1")
+            if row.post_syn_name not in trees:
+                L.append(f"    post_syn skeleton '{row.post_syn_name}' failed in Phase 1")
+        for row in missing_con:
+            L.append(f"  CONTACT {row.contact_name}  (axon={row.axon_name})")
+            if row.axon_name not in trees:
+                L.append(f"    axon skeleton '{row.axon_name}' failed in Phase 1")
+
+        section("QC FLAGS")
+        for tier in ('ok', 'warn', 'suspicious'):
+            n_pre  = sum(1 for r in connectivity.rows if r.pre_qc_flag  == tier)
+            n_post = sum(1 for r in syn_rows          if r.post_qc_flag == tier)
+            L.append(f"  {tier:<12}: pre={n_pre}, post={n_post}")
+        if any(r.pre_qc_flag == 'suspicious' for r in connectivity.rows):
+            L.append(
+                "\n  NOTE: suspicious pre-distances (>5 um) indicate the skeleton\n"
+                "  does not reach the bouton location. Check bbox_min_vox fix and\n"
+                "  re-run Phase 1 before trusting these numbers."
+            )
+
+        L.extend(["", "=" * W, ""])
+
+        Path(report_path).write_text('\n'.join(L))
+
+        self.logger.info(f"Written: {summary_path}")
+        self.logger.info(f"Written: {report_path}")
+        return summary_path, report_path

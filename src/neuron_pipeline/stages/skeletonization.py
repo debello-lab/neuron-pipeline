@@ -2,23 +2,45 @@
 Voxel Mask to SWC Skeleton Conversion
 Neural Reconstruction Pipeline
 
-This module converts cleaned binary voxel masks into SWC morphology files:
-- 3D skeletonization (medial axis thinning)
-- Radius estimation via Euclidean distance transform
-- Topologically-correct graph compression
-- Spur pruning and tree construction
-- SWC export with Arbor-compatible soma
+Skeletonization method: TEASAR via kimimaro
+    kimimaro.skeletonize() operates on binary voxel masks and returns a
+    compressed path graph (vertices + edges) directly.  It does not produce
+    a thinned voxel mask -- the output is already a sparse set of structural
+    nodes (endpoints and branch points) connected by edges.  No voxel-graph
+    construction or chain compression is required after this step.
+
+    If kimimaro proves unsuitable (e.g. fails to resolve thin processes on
+    this dataset), the next candidate is mesh-based skeletonization (e.g.
+    CGAL mean curvature flow).  The graph-to-tree and SWC stages below are
+    method-agnostic and would not need to change in that case -- only the
+    front end (_skeletonize_teasar) would be replaced.
+
+Pipeline:
+    1. TEASAR skeletonization (kimimaro) -> compressed graph
+    2. Radius estimation via Euclidean distance transform
+    3. Collapse bouton swelling clusters
+    4. Spur pruning
+    5. Convert graph to rooted directed tree
+    6. Insert synthetic 2-sample soma for Arbor compatibility
+    7. SWC export
+
+Coordinate conventions (applied consistently throughout):
+    - Mask axis order:        (Z, Y, X)
+    - kimimaro anisotropy:    (sz, sy, sx)  -- must match mask axis order
+    - kimimaro vertex order:  (Z, Y, X) local physical µm (after *= anisotropy)
+    - Node pos attribute:     (x_um, y_um, z_um) physical microns, XYZ
+    - coord_frame tag:        'physical_um_xyz_center'
 
 Author: Nicolas Randazzo
 """
 
 import numpy as np
-from typing import Tuple, Optional, Dict, Any, List
-from skimage.morphology import skeletonize
-from scipy.ndimage import distance_transform_edt
-from scipy.spatial import KDTree
+import kimimaro
 import networkx as nx
 import logging
+
+from scipy.ndimage import distance_transform_edt
+from typing import Dict, Any, List, Optional, Tuple
 
 
 class SkeletonExtractor:
@@ -26,13 +48,12 @@ class SkeletonExtractor:
     Convert binary voxel masks to SWC skeleton format.
 
     Pipeline:
-    1. Skeletonize voxel mask (medial axis thinning via Lee algorithm)
-    2. Compute radii via Euclidean distance transform
-    3. Build voxel-resolution graph (26-connectivity)
-    4. Compress graph using topological junction detection
-    5. Prune short leaf branches (spurs)
-    6. Convert to rooted directed tree
-    7. Insert synthetic 2-sample soma for Arbor compatibility
+        1. TEASAR skeletonization via kimimaro
+        2. EDT-based radius estimation
+        3. Collapse bouton swelling clusters
+        4. Spur pruning
+        5. Graph to rooted directed tree
+        6. Synthetic soma insertion for Arbor compatibility
     """
 
     def __init__(self, logger: Optional[logging.Logger] = None):
@@ -48,111 +69,101 @@ class SkeletonExtractor:
         voxel_size_um: Tuple[float, float, float],
         bbox_min_vox: Tuple[int, int, int] = (0, 0, 0),
         spur_length_um: float = 2.0,
+        teasar_scale: float = 1.5,
+        teasar_const_um: float = 0.1,
     ) -> Tuple[nx.DiGraph, Dict[str, Any]]:
         """
-        Extract a compressed skeleton tree from a binary voxel mask.
+        Extract a skeleton tree from a binary voxel mask.
 
         Args:
-            mask: Boolean 3D array (Z, Y, X).
-            voxel_size_um: Voxel dimensions in microns (sx, sy, sz).
-            bbox_min_vox: Origin coordinates in voxel space (minx, miny, minz).
-            spur_length_um: Prune leaf branches shorter than this (um).
+            mask            : Boolean 3D array (Z, Y, X).
+            voxel_size_um   : Voxel dimensions in microns (sx, sy, sz).
+            bbox_min_vox    : Global voxel origin of this mask (minx, miny, minz).
+            spur_length_um  : Prune leaf branches shorter than this (um).
+            teasar_scale    : TEASAR invalidation sphere scale factor.
+                              invalidation_radius = scale * DBF(x) + const
+                              Larger = more aggressive branch suppression.
+                              Start at 1.5; increase if spurious branches remain.
+            teasar_const_um : TEASAR invalidation sphere constant (um).
+                              Provides a minimum invalidation radius regardless
+                              of local DBF value.  Start at 1.0.
 
         Returns:
             (tree, stats)
-            tree  -- Directed compressed skeleton (NetworkX DiGraph).
-                    Node attrs : pos (um tuple), radius (um float), swc_type (int).
-                    Edge attrs : length (um), points (list of xyz tuples), radii (list).
+
+            tree  -- Directed skeleton tree (NetworkX DiGraph).
+
+            - Node attrs: pos (um XYZ tuple), radius (um float), swc_type (int).
+
+            - Edge attrs: length (um float), points (list), radii (list).
+
             stats -- Extraction statistics dictionary.
         """
-        self.logger.info("Starting skeleton extraction...")
+        self.logger.info("[extract_skeleton] Starting TEASAR skeleton extraction...")
 
-        stats = {
+        stats: Dict[str, Any] = {
             'input_voxel_count': int(np.sum(mask)),
-            'skeleton_voxel_count': 0,
-            'skeleton_points': 0,
-            'compressed_nodes': 0,
-            'compressed_edges': 0,
+            'skeleton_vertices': 0,
+            'skeleton_edges': 0,
+            'nodes_after_bouton_collapse': 0,
             'branches_pruned': 0,
+            'components_dropped': 0,
+            'bouton_clusters_collapsed': 0,
+            'bouton_nodes_removed': 0,
+            'bouton_radius_threshold_um': 0.0,
             'total_length_um': 0.0,
+            'teasar_scale': teasar_scale,
+            'teasar_const_um': teasar_const_um,
+            'coord_frame': 'physical_um_xyz_center',
         }
 
         if not np.any(mask):
-            self.logger.error("Input mask is empty")
+            self.logger.error("[extract_skeleton] Input mask is empty")
             return nx.DiGraph(), stats
 
         # ------------------------------------------------------------------
-        # Step 1: Skeletonize (Lee 1994 algorithm -- guaranteed 1-voxel-wide)
+        # Step 1: TEASAR skeletonization + radius estimation
         # ------------------------------------------------------------------
-        self.logger.info("Computing skeleton...")
-        skeleton_mask = skeletonize(mask.astype(bool), method='lee') > 0
-        skeleton_voxel_count = int(np.sum(skeleton_mask))
-        stats['skeleton_voxel_count'] = skeleton_voxel_count
-        self.logger.info(
-            f"Skeleton: {skeleton_voxel_count:,} voxels "
-            f"({100.0 * skeleton_voxel_count / stats['input_voxel_count']:.2f}% of input)"
+        G = self._skeletonize_teasar(
+            mask, voxel_size_um, bbox_min_vox, teasar_scale, teasar_const_um
         )
 
-        # ------------------------------------------------------------------
-        # Step 2: Distance transform for radii
-        # ------------------------------------------------------------------
-        self.logger.info("Computing distance transform...")
-        # voxel_size_um from extract_surfaces is (sx, sy, sz) - X first.
-        # distance_transform_edt sampling must match mask axis order (Z, Y, X).
-        sx, sy, sz = voxel_size_um
-        dist_um = distance_transform_edt(mask.astype(bool), sampling=(sz, sy, sx))
-
-        # ------------------------------------------------------------------
-        # Step 3: Extract voxel coordinates and radii
-        # ------------------------------------------------------------------
-        skel_coords = np.argwhere(skeleton_mask)   # (N, 3) in ZYX order
-        if len(skel_coords) == 0:
-            self.logger.error("Skeleton is empty after skeletonize()")
+        if G.number_of_nodes() == 0:
             return nx.DiGraph(), stats
 
-        # Minimum radius = half the shortest voxel dimension.
-        # This prevents sub-voxel radii (e.g. 5 nm) at skeleton surface voxels.
-        radius_floor = max(0.005, min(voxel_size_um) / 2.0)
-        radii_um = dist_um[skel_coords[:, 0], skel_coords[:, 1], skel_coords[:, 2]]
-        radii_um = np.maximum(radii_um, radius_floor)
-
-        stats['skeleton_points'] = len(skel_coords)
-        self.logger.info(
-            f"Radii: {radii_um.min():.3f} - {radii_um.max():.3f} um "
-            f"(median {np.median(radii_um):.3f} um, floor {radius_floor:.3f} um)"
-        )
+        stats['skeleton_vertices'] = G.number_of_nodes()
+        stats['skeleton_edges'] = G.number_of_edges()
 
         # ------------------------------------------------------------------
-        # Step 4: Build voxel-resolution graph
-        # ------------------------------------------------------------------
-        G = self.skeleton_to_graph(skeleton_mask, voxel_size_um, bbox_min_vox)
-
-        # ------------------------------------------------------------------
-        # Step 5: Topologically-correct graph compression
+        # Step 2: Collapse bouton swelling clusters
         #
-        # Use topological junction detection instead of raw graph degree. 
-        # In a 26-connected voxel graph a diagonal path voxel has degree 3 
-        # (back + forward + diagonal) even though it is topologically just 
-        # a pass-through. A node is a TRUE junction only if removing it 
-        # disconnects its neighbourhood into 2+ components.
+        # TEASAR can produce dense vertex clusters inside bulbous regions
+        # (boutons, spine heads) where many short paths converge.  Replace
+        # each such cluster with a single centroid node.
         # ------------------------------------------------------------------
-        G_compressed = self.compress_graph(G, radii_um)
-        stats['compressed_nodes'] = G_compressed.number_of_nodes()
-        stats['compressed_edges'] = G_compressed.number_of_edges()
+        G, collapse_stats = self.collapse_high_radius_clusters(G)
+        stats['bouton_clusters_collapsed'] = collapse_stats['clusters_collapsed']
+        stats['bouton_nodes_removed']      = collapse_stats['nodes_removed']
+        stats['bouton_radius_threshold_um'] = collapse_stats['radius_threshold_um']
+        stats['nodes_after_bouton_collapse'] = G.number_of_nodes()
 
         # ------------------------------------------------------------------
-        # Step 6: Spur pruning
+        # Step 3: Spur pruning
+        #
+        # kimimaro has its own dust/spur threshold, but pruning here gives
+        # explicit control in physical units and acts as a second-pass filter.
         # ------------------------------------------------------------------
-        G_pruned, spurs_removed = self.prune_spurs(G_compressed, spur_length_um)
+        G, spurs_removed = self.prune_spurs(G, spur_length_um)
         stats['branches_pruned'] = spurs_removed
 
         # ------------------------------------------------------------------
-        # Step 7: Convert to rooted directed tree
+        # Step 4: Convert to rooted directed tree
         # ------------------------------------------------------------------
-        tree = self.graph_to_tree(G_pruned)
+        tree, n_dropped = self.graph_to_tree(G)
+        stats['components_dropped'] = n_dropped
 
         # ------------------------------------------------------------------
-        # Step 8: Insert synthetic 2-sample soma for Arbor compatibility
+        # Step 5: Insert synthetic 2-sample soma for Arbor compatibility
         # ------------------------------------------------------------------
         tree = self.insert_synthetic_soma(tree)
 
@@ -160,235 +171,330 @@ class SkeletonExtractor:
             d.get('length', 0.0) for _, _, d in tree.edges(data=True)
         )
         self.logger.info(
-            f"Final tree: {tree.number_of_nodes()} nodes, "
+            f"[extract_skeleton] Final tree: {tree.number_of_nodes()} nodes, "
             f"{stats['total_length_um']:.2f} um total cable"
         )
         return tree, stats
 
     # -------------------------------------------------------------------------
-    # Step 4: Voxel-resolution graph
+    # Step 1: TEASAR skeletonization + radius estimation
     # -------------------------------------------------------------------------
 
-    def skeleton_to_graph(
+    def _skeletonize_teasar(
         self,
-        skeleton_mask: np.ndarray,
+        mask: np.ndarray,
         voxel_size_um: Tuple[float, float, float],
-        bbox_min_vox: Tuple[int, int, int] = (0, 0, 0),
+        bbox_min_vox: Tuple[int, int, int],
+        teasar_scale: float,
+        teasar_const_um: float,
     ) -> nx.Graph:
         """
-        Build a voxel-resolution undirected graph from the skeleton mask.
+        Run TEASAR via kimimaro and return an undirected NetworkX graph with
+        physical-space node positions and EDT-derived radii.
 
-        Node attrs : pos (um tuple), voxel_pos (ZYX ndarray).
-        Edge attrs : length (um).
+        kimimaro returns vertices in local physical µm -- it applies
+        ``vertices *= anisotropy`` internally before returning, so each
+        coordinate is already scaled to physical units relative to the
+        local mask origin.  Global positions are computed by adding the
+        bbox origin in physical µm.
+
+        Coordinate mapping per node (vertex index i):
+            vz_phys, vy_phys, vx_phys = vertices[i]   # local physical µm, ZYX
+            x_um = vx_phys + minx * sx
+            y_um = vy_phys + miny * sy
+            z_um = vz_phys + minz * sz
+            pos  = (x_um, y_um, z_um)                 # global physical µm, XYZ
+
+        Args:
+            mask            : Boolean 3D array (Z, Y, X).
+            voxel_size_um   : (sx, sy, sz).
+            bbox_min_vox    : (minx, miny, minz) global voxel origin.
+            teasar_scale    : TEASAR invalidation scale factor.
+            teasar_const_um : TEASAR invalidation constant (um).
+
+        Returns:
+            Undirected NetworkX graph.
+            Node attrs : pos (um XYZ tuple), radius (um float), degree (int).
+            Edge attrs : length (um float), points ([]), radii ([]).
+            Empty graph on failure.
         """
-        self.logger.info("Building voxel-resolution skeleton graph...")
-        skel_coords = np.argwhere(skeleton_mask)
-        if len(skel_coords) == 0:
-            return nx.Graph()
-
-        kd = KDTree(skel_coords)
-        G = nx.Graph()
         sx, sy, sz = voxel_size_um
         minx, miny, minz = bbox_min_vox
 
-        for i, coord in enumerate(skel_coords):
-            z, y, x = coord
-            G.add_node(i, pos=((x + minx) * sx, (y + miny) * sy, (z + minz) * sz), voxel_pos=coord)
+        # anisotropy must match mask axis order (Z, Y, X)
+        anisotropy = (sz, sy, sx)
 
-        for i, coord in enumerate(skel_coords):
-            for j in kd.query_ball_point(coord, r=1.8):   # sqrt(3) + margin = 26-conn
-                if i < j:
-                    pi = G.nodes[i]['pos']
-                    pj = G.nodes[j]['pos']
-                    G.add_edge(i, j, length=float(np.linalg.norm(
-                        np.array(pi) - np.array(pj)
-                    )))
+        self.logger.info(
+            f"[teasar] Running kimimaro (scale={teasar_scale}, "
+            f"const={teasar_const_um} um, anisotropy={anisotropy})"
+        )
+
+        skels = kimimaro.skeletonize(
+            mask.astype(np.uint8),
+            teasar_params={
+                'scale':                    teasar_scale,
+                'const':                    teasar_const_um,
+                'pdrf_scale':               100000,
+                'pdrf_exponent':            4,
+                'soma_invalidation_scale':  0.5,
+                'soma_invalidation_const':  0,
+            },
+            anisotropy=anisotropy,
+            dust_threshold=0,   # small components removed upstream in voxel_cleaning
+            progress=False,
+        )
+
+        # kimimaro keys output by label value; boolean mask produces label 1
+        if 1 not in skels or len(skels[1].vertices) == 0:
+            self.logger.error("[teasar] kimimaro returned empty skeleton")
+            return nx.Graph()
+
+        skel     = skels[1]
+        vertices = skel.vertices   # (N, 3) float, local physical µm, ZYX order
+        edges    = skel.edges      # (M, 2) int index pairs
+
+        self.logger.info(
+            f"[teasar] Raw skeleton: {len(vertices)} vertices, {len(edges)} edges"
+        )
+
+        # --- Radius estimation via EDT ---------------------------------------
+        # sampling=(sz, sy, sx) must match mask axis order (Z, Y, X)
+        dist_um = distance_transform_edt(mask.astype(bool), sampling=anisotropy)
+
+        radius_floor = max(0.005, min(voxel_size_um) / 2.0)
+
+        # vertices are in local physical µm; convert back to voxel indices for EDT lookup
+        vox_idx_z = np.clip(np.round(vertices[:, 0] / sz).astype(int), 0, mask.shape[0] - 1)
+        vox_idx_y = np.clip(np.round(vertices[:, 1] / sy).astype(int), 0, mask.shape[1] - 1)
+        vox_idx_x = np.clip(np.round(vertices[:, 2] / sx).astype(int), 0, mask.shape[2] - 1)
+
+        radii_um = dist_um[vox_idx_z, vox_idx_y, vox_idx_x]
+        radii_um = np.maximum(radii_um, radius_floor)
+
+        self.logger.info(
+            f"[teasar] Radii: {radii_um.min():.3f} - {radii_um.max():.3f} um "
+            f"(median {np.median(radii_um):.3f} um, floor {radius_floor:.3f} um)"
+        )
+
+        # --- Build NetworkX graph --------------------------------------------
+        G = nx.Graph()
+
+        for i, (vz_phys, vy_phys, vx_phys) in enumerate(vertices):
+            pos_x = float(vx_phys) + minx * sx
+            pos_y = float(vy_phys) + miny * sy
+            pos_z = float(vz_phys) + minz * sz
+            G.add_node(i, pos=(pos_x, pos_y, pos_z), radius=float(radii_um[i]))
+
+        for u, v in edges:
+            pu = np.array(G.nodes[int(u)]['pos'])
+            pv = np.array(G.nodes[int(v)]['pos'])
+            G.add_edge(
+                int(u), int(v),
+                length=float(np.linalg.norm(pu - pv)),
+                points=[],
+                radii=[],
+            )
 
         for n in G.nodes():
             G.nodes[n]['degree'] = G.degree(n)
 
         self.logger.info(
-            f"Voxel graph: {G.number_of_nodes():,} nodes, "
-            f"{G.number_of_edges():,} edges"
+            f"[teasar] Graph: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges"
         )
         return G
 
     # -------------------------------------------------------------------------
-    # Step 5: Topologically-correct compression
+    # Step 2: Collapse bouton swelling clusters
     # -------------------------------------------------------------------------
 
-    @staticmethod
-    def _is_topological_junction(G: nx.Graph, node: int) -> bool:
-        """
-        Return True if node is a topologically genuine junction or endpoint.
 
-        A node is structural if and only if removing it splits its immediate
-        neighbourhood into 2+ connected components (true branch point) or it
-        has <= 1 neighbour (endpoint / isolated).
-
-        This correctly handles the 26-connectivity artefact where a straight
-        diagonal path voxel has graph-degree 3 but is NOT a real junction.
-        """
-        neighbors = list(G.neighbors(node))
-        n = len(neighbors)
-        if n <= 1:
-            return True   # endpoint or isolated node
-        if n == 2:
-            return False  # unambiguously a chain node
-        # For degree ≥ 3: check whether neighbours stay connected without node
-        subgraph = G.subgraph(neighbors)
-        return nx.number_connected_components(subgraph) >= 2
-
-    def compress_graph(
+    def collapse_high_radius_clusters(
         self,
         G: nx.Graph,
-        radii_um: np.ndarray,
-        sample_spacing_um: float = 1.0,
-    ) -> nx.Graph:
+        radius_factor: float = 1.5,
+        min_cluster_nodes: int = 3,
+    ) -> Tuple[nx.Graph, Dict[str, Any]]:
+    
         """
-        Collapse degree-2 chains into single edges using topological detection.
+        Collapse dense node clusters caused by bouton swellings.
 
-        After compression every node is a topological endpoint (degree 1) or
-        a genuine branch point (neighbourhood splits on removal).  Each edge
-        stores intermediate sample points for SWC output.
+        TEASAR can produce tightly connected subgraphs of nodes with
+        abnormally large radii inside bulbous regions.  This replaces each
+        such cluster with a single centroid node, preserving external
+        connectivity.
+
+        Clustering uses single-linkage: two candidate nodes are linked if
+        their distance is less than the larger of their two radii.
 
         Args:
-            G               : Voxel-resolution undirected graph.
-            radii_um        : Radius per node (indexed same as G node IDs).
-            sample_spacing_um : Spacing between intermediate samples (um).
+            G                 : Undirected skeleton graph.
+                                Node attrs: pos, radius, degree.
+                                Edge attrs: length, points, radii.
+            radius_factor     : Nodes with radius > radius_factor * median
+                                are candidates.
+            min_cluster_nodes : Minimum cluster size to collapse.
 
         Returns:
-            Compressed graph.
-            Node attrs : pos, radius, degree.
-            Edge attrs : length, points, radii.
+            (collapsed_graph, stats)
+            stats keys: radius_threshold_um, median_radius_um,
+                        candidates_found, clusters_found,
+                        clusters_collapsed, nodes_removed.
         """
-        if G.number_of_nodes() == 0:
-            return nx.Graph()
+        zero_stats: Dict[str, Any] = {
+            'radius_threshold_um': 0.0,
+            'median_radius_um':    0.0,
+            'candidates_found':    0,
+            'clusters_found':      0,
+            'clusters_collapsed':  0,
+            'nodes_removed':       0,
+        }
 
-        self.logger.info("Classifying structural nodes (topological)...")
+        if G.number_of_nodes() < min_cluster_nodes:
+            return G.copy(), zero_stats
 
-        # Classify using topological test -- not raw degree
-        structural: set = set()
-        for n in G.nodes():
-            if self._is_topological_junction(G, n):
-                structural.add(n)
-
-        # Pure cycle -- break at an arbitrary node
-        if not structural:
-            structural.add(next(iter(G.nodes())))
+        all_radii      = np.array([G.nodes[n]['radius'] for n in G.nodes()])
+        median_radius  = float(np.median(all_radii))
+        radius_threshold = radius_factor * median_radius
 
         self.logger.info(
-            f"Structural nodes: {len(structural):,} / {G.number_of_nodes():,} "
-            f"({100.0 * len(structural) / G.number_of_nodes():.1f}%)"
+            f"[bouton_collapse] median_radius={median_radius:.3f} um, "
+            f"threshold={radius_threshold:.3f} um (factor={radius_factor})"
         )
 
-        # Build compressed graph with structural nodes as vertices
-        CG = nx.Graph()
-        for n in structural:
-            CG.add_node(
-                n,
-                pos=G.nodes[n]['pos'],
-                radius=float(radii_um[n]) if n < len(radii_um) else 1.0,
+        candidates = [n for n in G.nodes() if G.nodes[n]['radius'] > radius_threshold]
+
+        if not candidates:
+            self.logger.info("[bouton_collapse] No nodes above threshold -- skipping")
+            zero_stats['median_radius_um']    = median_radius
+            zero_stats['radius_threshold_um'] = radius_threshold
+            return G.copy(), zero_stats
+
+        if len(candidates) == G.number_of_nodes():
+            self.logger.warning(
+                f"[bouton_collapse] All {G.number_of_nodes()} nodes above threshold "
+                "-- skipping (segment may be uniformly large)"
+            )
+            zero_stats['median_radius_um']    = median_radius
+            zero_stats['radius_threshold_um'] = radius_threshold
+            zero_stats['candidates_found']    = len(candidates)
+            return G.copy(), zero_stats
+
+        # --- Graph-connectivity clustering ------------------------------------
+        # KDTree spatial proximity fails here: kimimaro bouton nodes are
+        # connected by skeleton edges but their physical positions can be
+        # farther apart than their EDT radii, so distance-based linkage
+        # misses the cluster.  Use the skeleton graph itself instead --
+        # two candidate nodes belong to the same cluster iff they are
+        # connected through the subgraph of candidates.
+        cand_set    = set(candidates)
+        all_clusters = [list(c) for c in nx.connected_components(G.subgraph(cand_set))]
+        clusters     = [c for c in all_clusters if len(c) >= min_cluster_nodes]
+
+        self.logger.info(
+            f"[bouton_collapse] {len(candidates)} candidates, "
+            f"{len(all_clusters)} cluster(s), "
+            f"{len(clusters)} >= {min_cluster_nodes} nodes"
+        )
+
+        if not clusters:
+            stats = dict(zero_stats)
+            stats['median_radius_um']    = median_radius
+            stats['radius_threshold_um'] = radius_threshold
+            stats['candidates_found']    = len(candidates)
+            stats['clusters_found']      = len(all_clusters)
+            return G.copy(), stats
+
+        # --- Batch collapse ---------------------------------------------------
+        orig_components = nx.number_connected_components(G)
+
+        member_to_centroid: Dict[int, int] = {}
+        centroid_info: Dict[int, Tuple[Tuple[float, float, float], float]] = {}
+        next_id = max(G.nodes()) + 1
+
+        for cluster in clusters:
+            cid = next_id
+            next_id += 1
+            pos = tuple(float(x) for x in np.mean(
+                [G.nodes[n]['pos'] for n in cluster], axis=0
+            ))
+            rad = float(max(G.nodes[n]['radius'] for n in cluster))
+            for n in cluster:
+                member_to_centroid[n] = cid
+            centroid_info[cid] = (pos, rad)
+
+        G_out = nx.Graph()
+
+        for n, attrs in G.nodes(data=True):
+            if n not in member_to_centroid:
+                G_out.add_node(n, **attrs)
+
+        for cid, (pos, rad) in centroid_info.items():
+            G_out.add_node(cid, pos=pos, radius=rad, degree=0)
+
+        for u, v, data in G.edges(data=True):
+            u_mapped = member_to_centroid.get(u, u)
+            v_mapped = member_to_centroid.get(v, v)
+
+            if u_mapped == v_mapped:
+                continue    # intra-cluster edge -- drop
+
+            pos_u = centroid_info[u_mapped][0] if u_mapped in centroid_info else G.nodes[u]['pos']
+            pos_v = centroid_info[v_mapped][0] if v_mapped in centroid_info else G.nodes[v]['pos']
+            new_length = float(np.linalg.norm(np.array(pos_u) - np.array(pos_v)))
+
+            # Filter intermediate samples inside cluster spheres
+            new_points: List[Tuple[float, float, float]] = []
+            new_radii:  List[float] = []
+            for pt, r in zip(data.get('points', []), data.get('radii', [])):
+                pt_arr = np.array(pt)
+                inside = any(
+                    float(np.linalg.norm(pt_arr - np.array(centroid_info[cid][0]))) < centroid_info[cid][1]
+                    for cid in (u_mapped, v_mapped)
+                    if cid in centroid_info
+                )
+                if not inside:
+                    new_points.append(pt)
+                    new_radii.append(r)
+
+            edge_key = (min(u_mapped, v_mapped), max(u_mapped, v_mapped))
+            if G_out.has_edge(*edge_key):
+                if new_length < G_out[edge_key[0]][edge_key[1]]['length']:
+                    G_out[edge_key[0]][edge_key[1]].update(
+                        length=new_length, points=new_points, radii=new_radii
+                    )
+            else:
+                G_out.add_edge(
+                    u_mapped, v_mapped,
+                    length=new_length, points=new_points, radii=new_radii,
+                )
+
+        for n in G_out.nodes():
+            G_out.nodes[n]['degree'] = G_out.degree(n)
+
+        new_components = nx.number_connected_components(G_out)
+        if new_components != orig_components:
+            self.logger.warning(
+                f"[bouton_collapse] Connectivity changed: "
+                f"{orig_components} -> {new_components} components"
             )
 
-        # Trace chains between pairs of structural nodes
-        visited_edges: set = set()
-
-        for start in structural:
-            for neighbor in list(G.neighbors(start)):
-                if (start, neighbor) in visited_edges or (neighbor, start) in visited_edges:
-                    continue
-
-                chain = [start]
-                chain_length = 0.0
-                current = start
-                nxt = neighbor
-
-                # Walk along degree-2 (non-structural) nodes
-                while nxt not in structural:
-                    chain_length += G[current][nxt]['length']
-                    chain.append(nxt)
-                    visited_edges.add((current, nxt))
-                    others = [nb for nb in G.neighbors(nxt) if nb != current]
-                    if not others:
-                        break
-                    current = nxt
-                    nxt = others[0]
-
-                # Add the final edge that leads to (or IS) the second structural node
-                if nxt in structural:
-                    chain_length += G[current][nxt]['length']
-                    chain.append(nxt)
-                    visited_edges.add((current, nxt))
-
-                    end = nxt
-                    if not CG.has_edge(start, end):
-                        pts, rads = self._sample_chain(chain, G, radii_um, sample_spacing_um)
-                        CG.add_edge(
-                            start, end,
-                            length=chain_length,
-                            points=pts,
-                            radii=rads,
-                        )
-
-        # Refresh stored degree
-        for n in CG.nodes():
-            CG.nodes[n]['degree'] = CG.degree(n)
-
+        nodes_removed = sum(len(c) for c in clusters) - len(clusters)
         self.logger.info(
-            f"Compressed: {G.number_of_nodes():,} -> {CG.number_of_nodes():,} nodes  "
-            f"({G.number_of_edges():,} -> {CG.number_of_edges():,} edges)"
+            f"[bouton_collapse] {len(clusters)} cluster(s) collapsed, "
+            f"{nodes_removed} nodes removed"
         )
-        return CG
 
-    def _sample_chain(
-        self,
-        chain: List[int],
-        G: nx.Graph,
-        radii_um: np.ndarray,
-        spacing: float,
-    ) -> Tuple[List[Tuple[float, float, float]], List[float]]:
-        """Return evenly-spaced intermediate samples along a voxel chain."""
-        if len(chain) < 2:
-            return [], []
-
-        positions = [np.array(G.nodes[n]['pos']) for n in chain]
-        node_radii = [
-            float(radii_um[n]) if n < len(radii_um) else 1.0
-            for n in chain
-        ]
-
-        # Cumulative arc length
-        cum = [0.0]
-        for i in range(1, len(positions)):
-            cum.append(cum[-1] + float(np.linalg.norm(positions[i] - positions[i - 1])))
-
-        total = cum[-1]
-        if total < spacing:
-            return [], []   # chain too short for any intermediate sample
-
-        pts: List[Tuple[float, float, float]] = []
-        rads: List[float] = []
-        seg = 0
-        dist = spacing
-
-        while dist < total:
-            while seg < len(cum) - 1 and cum[seg + 1] < dist:
-                seg += 1
-            if seg >= len(cum) - 1:
-                break
-            seg_len = cum[seg + 1] - cum[seg]
-            t = (dist - cum[seg]) / seg_len if seg_len > 0 else 0.0
-            pt = positions[seg] * (1 - t) + positions[seg + 1] * t
-            rd = node_radii[seg] * (1 - t) + node_radii[seg + 1] * t
-            pts.append(tuple(pt))
-            rads.append(float(rd))
-            dist += spacing
-
-        return pts, rads
+        return G_out, {
+            'radius_threshold_um': radius_threshold,
+            'median_radius_um':    median_radius,
+            'candidates_found':    len(candidates),
+            'clusters_found':      len(all_clusters),
+            'clusters_collapsed':  len(clusters),
+            'nodes_removed':       nodes_removed,
+        }
 
     # -------------------------------------------------------------------------
-    # Step 6: Spur pruning
+    # Step 3: Spur pruning
     # -------------------------------------------------------------------------
 
     def prune_spurs(
@@ -397,15 +503,39 @@ class SkeletonExtractor:
         spur_length_um: float = 2.0,
     ) -> Tuple[nx.Graph, int]:
         """
-        Iteratively remove leaf branches shorter than *spur_length_um*.
+        Iteratively remove leaf branches shorter than spur_length_um.
+
+        kimimaro has its own internal spur suppression via the invalidation
+        sphere, but pruning here provides explicit control in physical units
+        and acts as a second-pass filter.
 
         Args:
-            G              : Compressed undirected graph.
-            spur_length_um : Length threshold (um).
+            G              : Undirected skeleton graph.
+            spur_length_um : Prune threshold (um).
 
         Returns:
             (pruned_graph, number_of_spurs_removed)
         """
+        def _spur_path_length(G: nx.Graph, leaf: int) -> Tuple[Optional[float], int]:
+            # Walk from leaf toward the interior, accumulating edge lengths.
+            # Returns (cumulative_length, terminal_node) when the walk hits a
+            # branch point (degree >= 3) -- that spur is a pruning candidate.
+            # Returns (None, terminal) when the walk reaches another leaf:
+            # a leaf-to-leaf path is the main axis cable and must never be pruned.
+            length = 0.0
+            prev, cur = None, leaf
+            while True:
+                nbrs = [n for n in G.neighbors(cur) if n != prev]
+                if not nbrs:
+                    return None, cur        # isolated node -- skip
+                nxt = nbrs[0]
+                length += G[cur][nxt]['length']
+                if G.degree(nxt) >= 3:
+                    return length, nxt      # valid spur: ends at branch point
+                if G.degree(nxt) == 1:
+                    return None, nxt        # leaf-to-leaf: main axis, never prune
+                prev, cur = cur, nxt
+
         G = G.copy()
         removed = 0
         changed = True
@@ -414,12 +544,14 @@ class SkeletonExtractor:
             changed = False
             if G.number_of_nodes() <= 2:
                 break
-            to_remove = [
-                n for n in G.nodes()
-                if G.degree(n) == 1
-                and G[n][next(iter(G.neighbors(n)))]['length'] < spur_length_um
-            ]
-            for n in to_remove:
+            spurs = []
+            for n in list(G.nodes()):
+                if G.degree(n) == 1:
+                    spur_len, _ = _spur_path_length(G, n)
+                    if spur_len is not None and spur_len < spur_length_um:
+                        spurs.append((spur_len, n))
+            spurs.sort()                    # prune shortest first
+            for _, n in spurs:
                 if n in G and G.number_of_nodes() > 2:
                     G.remove_node(n)
                     removed += 1
@@ -428,41 +560,56 @@ class SkeletonExtractor:
         for n in G.nodes():
             G.nodes[n]['degree'] = G.degree(n)
 
-        self.logger.info(f"Spur pruning: removed {removed} branches < {spur_length_um} um")
+        self.logger.info(f"[prune_spurs] Removed {removed} branches < {spur_length_um} um")
         return G, removed
 
     # -------------------------------------------------------------------------
-    # Step 7: Graph -> rooted directed tree
+    # Step 4: Graph -> rooted directed tree
     # -------------------------------------------------------------------------
 
     def graph_to_tree(
         self,
         G: nx.Graph,
         root_node: Optional[int] = None,
-    ) -> nx.DiGraph:
+    ) -> Tuple[nx.DiGraph, int]:
         """
-        Convert a compressed undirected graph to a BFS-rooted directed tree.
+        Convert an undirected skeleton graph to a BFS-rooted directed tree.
 
-        Root selection (when *root_node* is None):
-        1. Find all endpoints (degree 1).
-        2. Among endpoints, pick the one that is one end of the graph diameter
-           (longest shortest-path).  This avoids selecting a bouton swelling
-           as the root, since it would typically lie mid-cable.
+        The skeleton graph may be disconnected if a thin process falls below
+        the TEASAR invalidation radius or spur pruning cuts a narrow neck.
+        Only the connected component containing the root is kept; other
+        components are dropped and counted.
+
+        This conversion forces a graph into a tree.  Cycles are implicitly
+        broken by BFS (the first path to each node is kept).  If the graph
+        is a proper tree (no cycles) after TEASAR + pruning, BFS produces an
+        exact result.  Any dropped edges or components are logged so the
+        caller can inspect them.
+
+        Root selection (when root_node is None):
+            1. Find all endpoints (degree 1).
+            2. Pick the endpoint that is one end of the graph diameter
+               (longest shortest-path between any two endpoints).
+               This avoids rooting at a bouton swelling mid-cable.
+            3. If no endpoints exist, pick the highest-degree node.
 
         Args:
-            G         : Compressed undirected skeleton graph.
+            G         : Undirected skeleton graph.
             root_node : Optional explicit root (graph node ID).
 
         Returns:
-            Directed tree (NetworkX DiGraph) with same node/edge attributes.
+            (tree, n_dropped)
+            tree      -- Directed tree (NetworkX DiGraph).
+                         coord_frame graph attr: 'physical_um_xyz_center'
+            n_dropped -- Number of disconnected components dropped (0 = ok).
         """
         if G.number_of_nodes() == 0:
-            return nx.DiGraph()
+            return nx.DiGraph(), 0
 
         if root_node is None:
             endpoints = [n for n in G.nodes() if G.nodes[n].get('degree', G.degree(n)) == 1]
             if endpoints:
-                max_dist, root_node = 0, endpoints[0]
+                max_dist, root_node = 0.0, endpoints[0]
                 for i, n1 in enumerate(endpoints):
                     for n2 in endpoints[i + 1:]:
                         try:
@@ -471,17 +618,30 @@ class SkeletonExtractor:
                                 max_dist, root_node = d, n1
                         except nx.NetworkXNoPath:
                             continue
-                self.logger.info(f"Root: node {root_node} (diameter endpoint)")
+                self.logger.info(f"[graph_to_tree] Root: node {root_node} (diameter endpoint)")
             else:
                 root_node = max(G.nodes(), key=lambda n: G.nodes[n].get('degree', G.degree(n)))
-                self.logger.info(f"Root: node {root_node} (highest degree, no endpoints)")
+                self.logger.info(f"[graph_to_tree] Root: node {root_node} (highest degree, no endpoints)")
+
+        n_components = nx.number_connected_components(G)
+        n_dropped    = n_components - 1
+
+        if n_dropped > 0:
+            root_component = nx.node_connected_component(G, root_node)
+            dropped_nodes  = G.number_of_nodes() - len(root_component)
+            self.logger.warning(
+                f"[graph_to_tree] Graph has {n_components} components -- "
+                f"keeping root component ({len(root_component)} nodes), "
+                f"dropping {n_dropped} component(s) ({dropped_nodes} nodes)."
+            )
+            G = G.subgraph(root_component)
 
         tree = nx.DiGraph()
         for n in G.nodes():
             tree.add_node(n, **G.nodes[n])
 
         visited = {root_node}
-        queue = [root_node]
+        queue   = [root_node]
         while queue:
             parent = queue.pop(0)
             for nb in G.neighbors(parent):
@@ -490,27 +650,31 @@ class SkeletonExtractor:
                     queue.append(nb)
                     tree.add_edge(parent, nb, **G.get_edge_data(parent, nb))
 
+        # Coordinate frame tag -- asserted by downstream centroid mapper
+        tree.graph['coord_frame'] = 'physical_um_xyz_center'
+
         self.logger.info(
-            f"Tree: {tree.number_of_nodes()} nodes, {tree.number_of_edges()} edges"
+            f"[graph_to_tree] Tree: {tree.number_of_nodes()} nodes, "
+            f"{tree.number_of_edges()} edges"
         )
-        return tree
+        return tree, n_dropped
 
     # -------------------------------------------------------------------------
-    # Step 8: Synthetic soma insertion
+    # Step 5: Synthetic soma insertion
     # -------------------------------------------------------------------------
 
     def insert_synthetic_soma(self, tree: nx.DiGraph) -> nx.DiGraph:
         """
         Insert a 2-sample synthetic soma stub at the root for Arbor compatibility.
 
-        Arbor's SWC parser rejects morphologies where the soma is described
+        Arbor's SWC parser rejects morphologies where the soma is represented
         by a single sample.  Since no biological soma location is known for
-        axon-only / dendrite-only segments, this inserts a second soma sample
-        displaced one root-radius along the first outgoing edge direction.
+        axon-only or dendrite-only segments, a second soma sample is inserted
+        displaced one root-radius along the direction of the first outgoing edge.
 
-        Sets node attribute ``swc_type``:
-            1  -- the two soma samples (root + synthetic neighbour)
-            0  -- all other nodes (compartment type = undefined)
+        Sets node attribute swc_type:
+            1 -- the two soma samples (root + synthetic neighbour)
+            0 -- all other nodes (compartment type = undefined)
 
         Args:
             tree: Directed skeleton tree from graph_to_tree().
@@ -524,20 +688,26 @@ class SkeletonExtractor:
         roots = [n for n in tree.nodes() if tree.in_degree(n) == 0]
         if not roots:
             return tree
-        root = roots[0]
 
+        if len(roots) > 1:
+            self.logger.warning(
+                f"[soma_insert] Tree has {len(roots)} root nodes (in_degree==0); "
+                "expected 1.  Only the first root receives a soma stub."
+            )
+
+        root     = roots[0]
         root_pos = np.array(tree.nodes[root]['pos'])
-        root_r = float(tree.nodes[root].get('radius', 1.0))
-        new_id = max(tree.nodes()) + 1
+        root_r   = float(tree.nodes[root].get('radius', 1.0))
+        new_id   = max(tree.nodes()) + 1
         children = list(tree.successors(root))
 
         if children:
             first_child = children[0]
-            child_pos = np.array(tree.nodes[first_child]['pos'])
-            direction = child_pos - root_pos
-            dist = float(np.linalg.norm(direction))
-            direction = direction / dist if dist > 0 else np.array([1.0, 0.0, 0.0])
-            soma_pos = tuple(root_pos + direction * root_r)
+            child_pos   = np.array(tree.nodes[first_child]['pos'])
+            direction   = child_pos - root_pos
+            dist        = float(np.linalg.norm(direction))
+            direction   = direction / dist if dist > 0 else np.array([1.0, 0.0, 0.0])
+            soma_pos    = tuple(root_pos + direction * root_r)
 
             tree.add_node(new_id, pos=soma_pos, radius=root_r, swc_type=1)
             old_edge = dict(tree[root][first_child])
@@ -554,7 +724,7 @@ class SkeletonExtractor:
         for n in tree.nodes():
             tree.nodes[n].setdefault('swc_type', 0)
 
-        self.logger.info(f"Synthetic soma: root={root}, stub={new_id}")
+        self.logger.info(f"[soma_insert] root={root}, stub={new_id}")
         return tree
 
 
@@ -564,15 +734,16 @@ class SkeletonExtractor:
 
 class SWCWriter:
     """
-    Write a compressed skeleton tree to SWC format.
+    Write a directed skeleton tree to SWC format.
 
     SWC columns: id  type  x  y  z  radius  parent_id
     type: 1=soma, 2=axon, 3=dendrite, 4=apical dendrite, 0=undefined
-    Requirement: parent_id < id for all non-root nodes.
 
-    Intermediate edge samples are interleaved between structural nodes so
-    that the file faithfully represents the cable geometry at the requested
-    spatial resolution.
+    Structural nodes (from the skeleton graph) are written at junctions and
+    endpoints.  Intermediate samples stored on each edge (edge attr 'points')
+    are interleaved between them to preserve cable geometry.  kimimaro edges
+    carry no intermediate samples by default, so 'points' will typically be
+    empty -- the writer handles both cases.
     """
 
     def __init__(self, logger: Optional[logging.Logger] = None):
@@ -585,7 +756,7 @@ class SWCWriter:
         metadata: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
-        Write a compressed skeleton tree to an SWC file.
+        Write a skeleton tree to an SWC file.
 
         Node attributes read:
             pos      (tuple)  -- (x, y, z) in um
@@ -593,26 +764,26 @@ class SWCWriter:
             swc_type (int)    -- SWC compartment tag
 
         Edge attributes read:
-            points   (list)   -- intermediate (x, y, z) samples
+            points   (list)   -- intermediate (x, y, z) samples (may be empty)
             radii    (list)   -- radii at those samples
 
         Args:
-            tree        : Compressed directed skeleton tree.
+            tree        : Directed skeleton tree.
             output_path : Destination .swc path.
             metadata    : Optional dict written to file header.
 
         Returns:
             output_path (str)
         """
-        self.logger.info(f"Writing SWC: {output_path}")
+        self.logger.info(f"[write_swc] Writing: {output_path}")
 
         if tree.number_of_nodes() == 0:
             raise ValueError("Skeleton tree is empty -- nothing to write.")
 
-        # Explicit Unix line endings via newline='\n'
         with open(output_path, 'w', newline='\n') as f:
             f.write("# SWC format skeleton\n")
             f.write("# Generated by VAST Neural Reconstruction Pipeline\n")
+            f.write("# Skeletonization method: TEASAR (kimimaro)\n")
             f.write("# WARNING: Soma is synthetic. No biological soma location is known.\n")
             if metadata:
                 for key, val in metadata.items():
@@ -622,30 +793,27 @@ class SWCWriter:
             self._write_tree_swc(f, tree)
 
         n_samples = (
-            1  # root itself
+            1
             + sum(1 + len(d.get('points', [])) for _, _, d in tree.edges(data=True))
         )
-        self.logger.info(f"Wrote {n_samples} SWC samples -> {output_path}")
+        self.logger.info(f"[write_swc] Wrote {n_samples} samples -> {output_path}")
         return output_path
-
-    # ------------------------------------------------------------------
 
     def _write_tree_swc(self, f, tree: nx.DiGraph) -> None:
         """
-        BFS traversal of the tree.
+        BFS traversal writing structural nodes and interleaved edge samples.
 
-        For each edge (parent -> child) the intermediate samples stored on
-        that edge are emitted between the parent structural node and the
-        child structural node, maintaining parent_id < id throughout.
+        parent_id < id is maintained throughout by processing nodes in BFS
+        order and emitting edge intermediate samples before the child node.
         """
         roots = [n for n in tree.nodes() if tree.in_degree(n) == 0]
         if not roots:
-            self.logger.warning("No root found; using first node.")
+            self.logger.warning("[write_swc] No root found; using first node.")
             roots = [next(iter(tree.nodes()))]
         root = roots[0]
 
         swc_id = 1
-        queue = [(root, -1)]   # (graph_node, parent_swc_id)
+        queue  = [(root, -1)]   # (graph_node, parent_swc_id)
 
         while queue:
             node, parent_swc_id = queue.pop(0)
@@ -660,6 +828,8 @@ class SWCWriter:
                 f"{radius:.6f} {parent_swc_id}\n"
             )
             node_swc_id = swc_id
+            # Stamp SWC row ID for downstream resolvers (e.g. centroid mapper)
+            tree.nodes[node]['swc_id'] = node_swc_id
             swc_id += 1
 
             for child in tree.successors(node):

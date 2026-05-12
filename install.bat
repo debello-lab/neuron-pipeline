@@ -2,7 +2,7 @@
 setlocal
 
 :: ============================================================
-:: ms-neuron-pipeline — environment setup
+:: ms-neuron-pipeline -- environment setup
 :: ============================================================
 :: Creates a .venv, installs dependencies, and installs the
 :: local packages (neuron_pipeline + vastpy) in editable mode.
@@ -48,7 +48,7 @@ echo [OK] Python %PY_VER% detected.
 :: 3. Create virtual environment
 :: ------------------------------------------------------------
 if exist "%VENV_DIR%\Scripts\activate.bat" (
-    echo [INFO] Virtual environment already exists at %VENV_DIR% — skipping creation.
+    echo [INFO] Virtual environment already exists at %VENV_DIR% -- skipping creation.
 ) else (
     echo [INFO] Creating virtual environment in %VENV_DIR% ...
     python -m venv %VENV_DIR%
@@ -69,7 +69,7 @@ call "%VENV_DIR%\Scripts\activate.bat"
 echo [INFO] Upgrading pip...
 python -m pip install --upgrade pip
 if errorlevel 1 (
-    echo [WARNING] pip upgrade failed — continuing anyway.
+    echo [WARNING] pip upgrade failed -- continuing anyway.
 )
 
 :: ------------------------------------------------------------

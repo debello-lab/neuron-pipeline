@@ -31,20 +31,27 @@ class SegmentSurfaceExtractor:
     - Production-grade quality assurance
     """
     
-    def __init__(self, vast: VASTControlClass, output_dir: str = "./output"):
+    def __init__(self, vast: VASTControlClass, output_dir: str = "./output",
+                 logger: Optional[logging.Logger] = None):
         """
         Initialize the extractor.
-        
+
         Args:
             vast: Connected VASTControlClass instance
             output_dir: Base directory for output files
+            logger: Shared pipeline logger. If provided, used directly and no
+                    per-instance log file is created. If None, a per-instance
+                    file logger is created (legacy behaviour).
         """
         self.vast = vast
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        
+
         # Setup logging
-        self._setup_logging()
+        if logger is not None:
+            self.logger = logger
+        else:
+            self._setup_logging()
         
         # Cache dataset info
         self.dataset_info: Dict[str, Any] = None  # type: ignore
@@ -301,16 +308,15 @@ class SegmentSurfaceExtractor:
             Tuple of (merged_vertices, merged_faces)
         """
 
-        assert faces2 is not None and faces1 is not None
         # Handle empty cases
         if verts1 is None or (isinstance(verts1, np.ndarray) and len(verts1) == 0):
             if verts2 is None or (isinstance(verts2, np.ndarray) and len(verts2) == 0):
                 return np.array([]), np.array([])
-            assert verts2 is not None
+            assert verts2 is not None and faces2 is not None
             return verts2.copy(), faces2.copy()
-        
+
         if verts2 is None or (isinstance(verts2, np.ndarray) and len(verts2) == 0):
-            assert verts1 is not None
+            assert verts1 is not None and faces1 is not None
             return verts1.copy(), faces1.copy()
         
         # Merge vertices
@@ -369,7 +375,7 @@ class SegmentSurfaceExtractor:
         try:
             seg_image = self.vast.get_seg_image_rle_decoded(
                 miplevel, minx, maxx, miny, maxy, minz, maxz,
-                surfonlyflag=0, flipflag=0
+                surfonlyflag=1, flipflag=0
             )
         finally:
             self._set_socket_timeout(10)
@@ -389,19 +395,34 @@ class SegmentSurfaceExtractor:
         self.logger.debug(f"  Block has {int(voxel_count):,} voxels")
         
         del seg_image
-        
-        # Add boundary padding if closing surfaces
+
+        # Pad only the faces of this block that touch the dataset boundary.
+        # Internal block faces already have a zero ring from the overlap extension
+        # fetched in _extract_with_blocks.  Padding internal faces with extra zeros
+        # would create spurious cap triangles at every block seam.
         offset_adjust = np.array([0, 0, 0])
         if close_surfaces:
-            padded = np.zeros((
-                binary_volume.shape[0] + 2,
-                binary_volume.shape[1] + 2,
-                binary_volume.shape[2] + 2
-            ), dtype=np.float32)
-            padded[1:-1, 1:-1, 1:-1] = binary_volume
-            binary_volume = padded
-            offset_adjust = np.array([-1, -1, -1])
-        
+            at_min_z = (minz <= global_bounds[4])
+            at_max_z = (maxz >= global_bounds[5])
+            at_min_y = (miny <= global_bounds[2])
+            at_max_y = (maxy >= global_bounds[3])
+            at_min_x = (minx <= global_bounds[0])
+            at_max_x = (maxx >= global_bounds[1])
+            pad_z0 = 1 if at_min_z else 0
+            pad_z1 = 1 if at_max_z else 0
+            pad_y0 = 1 if at_min_y else 0
+            pad_y1 = 1 if at_max_y else 0
+            pad_x0 = 1 if at_min_x else 0
+            pad_x1 = 1 if at_max_x else 0
+            needs_close = (pad_z0 or pad_z1 or pad_y0 or pad_y1 or pad_x0 or pad_x1)
+            if needs_close:
+                binary_volume = np.pad(
+                    binary_volume,
+                    ((pad_z0, pad_z1), (pad_y0, pad_y1), (pad_x0, pad_x1)),
+                    mode='constant', constant_values=0
+                )
+                offset_adjust = np.array([-pad_z0, -pad_y0, -pad_x0], dtype=float)
+
         # Run marching cubes
         try:
             verts, faces, normals, values = measure.marching_cubes(
@@ -701,15 +722,35 @@ class SegmentSurfaceExtractor:
         if miplevel > 0 and mip_scale_val[2] != 1:
             max_z_bound = max_z_bound // mip_scale_val[2]
 
-        # Add padding for marching cubes, clamped to dataset bounds
-        padding = 2 if close_surfaces else 1
-        minx = max(0, minx - padding)
-        miny = max(0, miny - padding)
-        minz = max(0, minz - padding)
-        maxx = min(max_x_bound, maxx + padding)  # CLAMP
-        maxy = min(max_y_bound, maxy + padding)  # CLAMP
-        maxz = min(max_z_bound, maxz + padding)  # CLAMP
-        
+        # Add 1-voxel padding around the segment bounding box so marching cubes
+        # sees zeros outside the neuron on faces that don't touch the dataset edge.
+        # Faces that DO touch the dataset edge cannot be extended (no data exists
+        # beyond the boundary) -- those faces are handled by the explicit zero-pad
+        # below (close_surfaces=True), which only activates on clamped faces.
+        minx = max(0, minx - 1)
+        miny = max(0, miny - 1)
+        minz = max(0, minz - 1)
+        maxx = min(max_x_bound, maxx + 1)
+        maxy = min(max_y_bound, maxy + 1)
+        maxz = min(max_z_bound, maxz + 1)
+
+        # Track which faces hit the dataset boundary (cannot extend further).
+        # close_surfaces will only pad these faces with explicit zeros.
+        at_min_x = (minx == 0)
+        at_min_y = (miny == 0)
+        at_min_z = (minz == 0)
+        at_max_x = (maxx == max_x_bound)
+        at_max_y = (maxy == max_y_bound)
+        at_max_z = (maxz == max_z_bound)
+        needs_close = (at_min_x or at_min_y or at_min_z or
+                       at_max_x or at_max_y or at_max_z)
+        if close_surfaces and needs_close:
+            self.logger.info(
+                "Segment touches dataset boundary -- will pad boundary faces with zeros: "
+                f"min=({at_min_x},{at_min_y},{at_min_z}) "
+                f"max=({at_max_x},{at_max_y},{at_max_z})"
+            )
+
         self.logger.info(f"Loading volume at MIP {miplevel}")
         self.logger.info(f"  Region: X=[{minx},{maxx}] Y=[{miny},{maxy}] Z=[{minz},{maxz}]")
         
@@ -726,7 +767,7 @@ class SegmentSurfaceExtractor:
         try:
             seg_image = self.vast.get_seg_image_rle_decoded(
                 miplevel, minx, maxx, miny, maxy, minz, maxz,
-                surfonlyflag=0, flipflag=0
+                surfonlyflag=1, flipflag=0
             )
         finally:
             # Always clear translation
@@ -754,19 +795,37 @@ class SegmentSurfaceExtractor:
         # Free up memory
         del seg_image
         
-        # Add boundary padding if closing surfaces
+        # Pad only the faces that touch the dataset boundary with explicit zeros
+        # so that marching cubes closes the isosurface there.  Faces that don't
+        # touch the boundary already have a zero ring from the 1-voxel bounding-
+        # box extension fetched above.
+        #
+        # The binary_volume axis order matches the VAST return convention: (Z,Y,X).
+        # Boundary flags therefore map as:
+        #   axis 0 = Z:  at_min_z -> pad front,  at_max_z -> pad back
+        #   axis 1 = Y:  at_min_y -> pad top,    at_max_y -> pad bottom
+        #   axis 2 = X:  at_min_x -> pad left,   at_max_x -> pad right
         offset_adjust = np.array([0, 0, 0])
-        if close_surfaces:
-            self.logger.debug("Adding boundary padding for closed surfaces")
-            padded = np.zeros((
-                binary_volume.shape[0] + 2,
-                binary_volume.shape[1] + 2,
-                binary_volume.shape[2] + 2
-            ), dtype=np.float32)
-            padded[1:-1, 1:-1, 1:-1] = binary_volume
-            binary_volume = padded
-            offset_adjust = np.array([-1, -1, -1])
-        
+        if close_surfaces and needs_close:
+            self.logger.debug("Padding dataset-boundary faces with zeros for surface closure")
+            # Determine how many slices to add on each side per axis.
+            # (1 slice is enough; marching cubes only needs one zero layer.)
+            pad_z0 = 1 if at_min_z else 0
+            pad_z1 = 1 if at_max_z else 0
+            pad_y0 = 1 if at_min_y else 0
+            pad_y1 = 1 if at_max_y else 0
+            pad_x0 = 1 if at_min_x else 0
+            pad_x1 = 1 if at_max_x else 0
+            binary_volume = np.pad(
+                binary_volume,
+                ((pad_z0, pad_z1), (pad_y0, pad_y1), (pad_x0, pad_x1)),
+                mode='constant', constant_values=0
+            )
+            # Shift marching-cubes output back so coordinates stay in the
+            # original fetch-region frame.  Only axes that got a leading pad
+            # need an offset correction.
+            offset_adjust = np.array([-pad_z0, -pad_y0, -pad_x0], dtype=float)
+
         # Run marching cubes
         self.logger.info("Running marching cubes algorithm...")
         try:
@@ -991,7 +1050,7 @@ class SegmentSurfaceExtractor:
         try:
             seg_image = self.vast.get_seg_image_rle_decoded(
                 miplevel, minx, maxx, miny, maxy, minz, maxz,
-                surfonlyflag=0, flipflag=0
+                surfonlyflag=1, flipflag=0
             )
         finally:
             # Always clear translation
@@ -1008,7 +1067,11 @@ class SegmentSurfaceExtractor:
         # Create binary volume
         self.logger.info("Creating binary volume...")
         mask = (seg_image == segment_id).astype(bool)
-        
+        # get_seg_image_rle_decoded returns (X, Y, Z) via Fortran-order reshape.
+        # All downstream stages (distance_transform_edt sampling, skeleton_to_graph,
+        # centroid code, structuring element) expect (Z, Y, X) -- transpose here once.
+        mask = mask.transpose(2, 1, 0)
+
         # Store the min bounds in voxels
         bbox_min_vox = (minx, miny, minz)
         

@@ -12,7 +12,7 @@ from neuron_pipeline.stages.skeletonization import SkeletonExtractor, SWCWriter
 SEGMENT_ID   = int(sys.argv[1]) if len(sys.argv) > 1 else 1
 MIPLEVEL     = 1        # 0 = full resolution, 1 = half resolution
 PADDING      = 2        # extra voxels around bounding box
-SPUR_UM      = 0.5      # prune leaf branches shorter than this (micrometers)
+SPUR_UM      = 2    # prune leaf branches shorter than this (micrometers)
 OUTPUT_DIR   = Path(__file__).parent.parent / "diag_output"
 
 logging.basicConfig(
@@ -25,72 +25,123 @@ log = logging.getLogger("diag")
 def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    swc_dir = OUTPUT_DIR / "swc"
+    swc_dir.mkdir(parents=True, exist_ok=True)
+
     # 1. Connect to VAST
     log.info("Connecting to VAST...")
     vast = VASTControlClass()
-    vast.connect(host="127.0.0.1", port=22081, timeout=100)
+    if not vast.connect(host="127.0.0.1", port=22081, timeout=100):
+        log.error("Failed to connect to VAST. Ensure VAST is running and API is enabled.")
+        return
     log.info("Connected.")
 
-    # 2. Extract voxel mask
-    log.info(f"Extracting voxel mask for segment {SEGMENT_ID} (MIP {MIPLEVEL})...")
     extractor = SegmentSurfaceExtractor(vast, str(OUTPUT_DIR))
-    mask, bbox_min, voxel_size, _ = extractor.extract_segment(
+    cleaner   = VoxelCleaner()
+    skel      = SkeletonExtractor()
+    writer    = SWCWriter()
+
+    name = str(SEGMENT_ID)
+    log.info(f"--- segment {SEGMENT_ID} ---")
+
+    # 1A. Voxel extraction
+    log.info(f"Extracting voxel mask for segment {SEGMENT_ID} (MIP {MIPLEVEL})...")
+    mask, bbox_min, voxel_size, _ = extractor.extract_segment_voxel(
         segment_id=SEGMENT_ID,
         miplevel=MIPLEVEL,
         padding=PADDING,
     )
 
     if mask is None or voxel_size is None or bbox_min is None:
-        log.error("Voxel extraction failed. Is the segment ID valid?")
+        log.error(f"Voxel extraction failed for segment {SEGMENT_ID}")
         return
 
-    log.info(
-        f"Mask shape: {mask.shape}  |  voxel size: {voxel_size} um  "
-        f"|  bbox_min: {bbox_min}  |  filled voxels: {int(mask.sum()):,}"
-    )
-
-    # 3. Clean mask
-    log.info("Cleaning mask...")
-    cleaner = VoxelCleaner()
-    cleaned, clean_stats = cleaner.clean_mask(
+    # 1B. Cleaning -- first pass to count components
+    cleaned, stats = cleaner.clean_mask(
         mask,
+        closing_radius_um=0.05, # 50nm
         keep_largest_only=True,
         fill_holes=True,
         smooth_iterations=0,
-    )
-    log.info(f"Clean stats: {clean_stats}")
-
-    # 4. Skeletonize
-    log.info("Skeletonizing...")
-    skel = SkeletonExtractor()
-    tree, skel_stats = skel.extract_skeleton(
-        mask=cleaned,
         voxel_size_um=voxel_size,
         bbox_min_vox=bbox_min,
+    )
+
+    if stats['original_components'] > 1:
+        log.warning(
+            f"  {name}: {stats['original_components']} connected components "
+            f"(sizes: kept={stats['kept_components']}, removed={stats['removed_components']})"
+        )
+
+        # Re-clean keeping only the largest component
+        cleaned, stats = cleaner.clean_mask(
+            cleaned.mask,
+            closing_radius_um=0.05,
+            keep_largest_only=False,
+            fill_holes=False,
+            smooth_iterations=0,
+            bbox_min_vox=bbox_min,
+            voxel_size_um=voxel_size,
+        )
+
+    # 1C. Skeletonize voxels (includes compression, pruning, soma insertion)
+    tree, skel_stats = skel.extract_skeleton(
+        mask=cleaned.mask,
+        voxel_size_um=voxel_size,
+        bbox_min_vox=cleaned.bbox_min_vox,
         spur_length_um=SPUR_UM,
     )
-
     if tree.number_of_nodes() == 0:
-        log.error("Skeletonization produced an empty tree.")
+        log.error(f"Skeletonization produced empty tree for segment {SEGMENT_ID}")
         return
 
-    log.info(f"Skeleton stats: {skel_stats}")
-
-    # 5. Write SWC
-    swc_path = OUTPUT_DIR / f"seg_{SEGMENT_ID}_mip{MIPLEVEL}.swc"
-    writer = SWCWriter()
+    # 1D. Write SWC
+    swc_path = str(swc_dir / f"cell_{name}.swc")
     writer.write_swc(
         tree=tree,
-        output_path=str(swc_path),
+        output_path=swc_path,
         metadata={
-            "segment_id":   SEGMENT_ID,
-            "miplevel":     MIPLEVEL,
-            "voxel_size_um": voxel_size,
-            "bbox_min_vox": bbox_min,
-            **{k: v for k, v in skel_stats.items()},
+            'segment_id': SEGMENT_ID,
+            'segment_name': name,
+            'miplevel': MIPLEVEL,
+            'bbox_min_vox': str(bbox_min),      # (minx, miny, minz) in voxels
+            'voxel_size_um': str(voxel_size),   # (sx, sy, sz) in µm
+            'coord_frame': 'physical_um_xyz',
+            'skeleton_vertices': skel_stats.get('skeleton_vertices'),
+            'skeleton_edges': skel_stats.get('skeleton_edges'),
+            'spurs_pruned': skel_stats.get('branches_pruned'),
+            'total_length_um': f"{skel_stats.get('total_length_um', 0):.2f}",
         },
     )
-    log.info(f"Done. SWC written -> {swc_path}")
+
+    log.info(f"-> {swc_path}  ({tree.number_of_nodes()} nodes)")
+
+    # 1E. Extract and save surface mesh as OBJ
+    log.info(f"Extracting surface mesh for segment {SEGMENT_ID}...")
+    METADATA = extractor.get_segment_metadata(SEGMENT_ID)
+    if not METADATA:
+        log.error(f"Failed to retrieve metadata for segment {SEGMENT_ID}")
+        return
+    vertices, faces = extractor._extract_full_volume(
+                    SEGMENT_ID, 
+                    METADATA, 
+                    MIPLEVEL, 
+                    close_surfaces=True
+                )
+    if vertices is None or faces is None:
+        log.error(f"Surface mesh extraction failed for segment {SEGMENT_ID}")
+        return
+    obj_path = extractor._save_mesh(
+                vertices, 
+                faces, 
+                METADATA, 
+                output_format='obj', 
+                custom_filename=f'cell_{name}'
+            )
+    if obj_path:
+        log.info(f"-> {obj_path}")
+    else:
+        log.warning(f"Surface mesh extraction failed for segment {SEGMENT_ID}")
 
 
 if __name__ == "__main__":

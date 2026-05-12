@@ -31,7 +31,7 @@ import logging
 import numpy as np
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Collection, Dict, List, Optional, Tuple
 
 from neuron_pipeline.stages.extract_surfaces import SegmentSurfaceExtractor
 from neuron_pipeline.stages.segment_classifier import SegmentRegistry, SegmentInfo
@@ -46,6 +46,10 @@ class CentroidEntry:
     cy_um: float
     cz_um: float
     method: str                      # voxel | bbox_fallback | anchor
+    # Coordinate frame tag -- must match the skeleton tree's coord_frame
+    # attribute set in Phase 1 (graph_to_tree). Phase 3 asserts equality
+    # before building the KDTree to catch silent space mismatches.
+    coord_frame: str = 'physical_um_xyz_center'
 
 
 @dataclass
@@ -71,7 +75,7 @@ class CentroidTable:
     def write_csv(self, path: str) -> str:
         """Write centroids to a CSV file. Returns the path written."""
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        fieldnames = ['name', 'seg_id', 'role', 'cx_um', 'cy_um', 'cz_um', 'method']
+        fieldnames = ['name', 'seg_id', 'role', 'cx_um', 'cy_um', 'cz_um', 'method', 'coord_frame']
         with open(path, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
@@ -126,15 +130,17 @@ class CentroidExtractor:
         miplevel: int = DEFAULT_MIPLEVEL,
         padding: int = DEFAULT_PADDING,
         roles: Tuple[str, ...] = _TARGET_ROLES,
+        only_names: Optional[Collection[str]] = None,
     ) -> CentroidTable:
         """
         Compute centroids for all segments whose role is in *roles*.
 
         Args:
-            registry  : SegmentRegistry built by Phase 0.
-            miplevel  : MIP level for voxel extraction (0 = full resolution).
-            padding   : Padding voxels added around the bounding box.
-            roles     : Tuple of role strings to process.
+            registry   : SegmentRegistry built by Phase 0.
+            miplevel   : MIP level for voxel extraction (0 = full resolution).
+            padding    : Padding voxels added around the bounding box.
+            roles      : Tuple of role strings to process.
+            only_names : If given, restrict to segments whose name is in this collection.
 
         Returns:
             CentroidTable with one entry per processed segment.
@@ -143,6 +149,7 @@ class CentroidExtractor:
             info
             for info in registry.segments.values()
             if info.role in roles
+            and (only_names is None or info.name in only_names)
         ]
 
         role_counts = {}
@@ -238,22 +245,23 @@ class CentroidExtractor:
         if bbox_min_vox is None or voxel_size_um is None:
             return None
 
-        # mask is (Z, Y, X); bbox_min_vox is (minx, miny, minz)
-        # voxel_size_um is (sx, sy, sz)
+        # mask is (Z, Y, X) following numpy convention; np.where returns in that order.
         z_idx, y_idx, x_idx = np.where(mask)
 
-        
-        cx_vox = x_idx.mean() + bbox_min_vox[0]
-        cy_vox = y_idx.mean() + bbox_min_vox[1]
-        cz_vox = z_idx.mean() + bbox_min_vox[2]
+        # Step 1 - local centroid in voxel space (relative to the extracted sub-volume)
+        local_cx_vox = x_idx.mean()
+        local_cy_vox = y_idx.mean()
+        local_cz_vox = z_idx.mean()
 
-        # cx_vox = (x_idx + 0.5).mean() + bbox_min_vox[0]
-        # cy_vox = (y_idx + 0.5).mean() + bbox_min_vox[1]
-        # cz_vox = (z_idx + 0.5).mean() + bbox_min_vox[2]
+        # Step 2 - global voxel space (add bbox origin: bbox_min_vox = (minx, miny, minz)), add 0.5 for center of voxel standard convention
+        global_cx_vox = (local_cx_vox + 0.5) + bbox_min_vox[0]
+        global_cy_vox = (local_cy_vox + 0.5) + bbox_min_vox[1]
+        global_cz_vox = (local_cz_vox + 0.5) + bbox_min_vox[2]
 
-        cx_um = float(cx_vox * voxel_size_um[0])
-        cy_um = float(cy_vox * voxel_size_um[1])
-        cz_um = float(cz_vox * voxel_size_um[2])
+        # Step 3 - physical µm (voxel_size_um = (sx, sy, sz); center-of-voxel convention)
+        cx_um = float(global_cx_vox * voxel_size_um[0])
+        cy_um = float(global_cy_vox * voxel_size_um[1])
+        cz_um = float(global_cz_vox * voxel_size_um[2])
 
         return CentroidEntry(
             name=info.name,
@@ -290,9 +298,9 @@ class CentroidExtractor:
         sy = di['voxelsizey'] / 1000.0
         sz = di['voxelsizez'] / 1000.0
 
-        cx_um = float((bbox[0] + bbox[3]) / 2.0 * sx)
-        cy_um = float((bbox[1] + bbox[4]) / 2.0 * sy)
-        cz_um = float((bbox[2] + bbox[5]) / 2.0 * sz)
+        cx_um = float(((bbox[0] + bbox[3]) / 2.0 + 0.5) * sx)
+        cy_um = float(((bbox[1] + bbox[4]) / 2.0 + 0.5) * sy)
+        cz_um = float(((bbox[2] + bbox[5]) / 2.0 + 0.5) * sz)
 
         return CentroidEntry(
             name=info.name,
@@ -325,9 +333,9 @@ class CentroidExtractor:
             sx = di['voxelsizex'] / 1000.0
             sy = di['voxelsizey'] / 1000.0
             sz = di['voxelsizez'] / 1000.0
-            cx_um = float(ap[0] * sx)
-            cy_um = float(ap[1] * sy)
-            cz_um = float(ap[2] * sz)
+            cx_um = float((ap[0] + 0.5) * sx)
+            cy_um = float((ap[1] + 0.5) * sy)
+            cz_um = float((ap[2] + 0.5) * sz)
         else:
             cx_um = cy_um = cz_um = 0.0
 
