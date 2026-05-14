@@ -242,6 +242,7 @@ class SkeletonExtractor:
             anisotropy=anisotropy,
             dust_threshold=0,   # small components removed upstream in voxel_cleaning
             progress=False,
+            fix_branching=True,
         )
 
         # kimimaro keys output by label value; boolean mask produces label 1

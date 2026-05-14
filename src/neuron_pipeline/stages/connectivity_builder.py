@@ -23,7 +23,10 @@ Consumes outputs from all previous phases and produces two deliverables:
    - contacts      - list of (pre_loc, contact_loc) dicts  (no mechanism)
 
    Locations follow the Arbor cable-cell location format:
-       {"cell": "A1", "branch": <edge_u>, "pos": <arc_frac>}
+       {"cell": "A1", "branch": <swc_row_id>, "pos": <arc_frac>}
+
+   branch is the SWC row ID (pre_swc_u / post_swc_u from connectivity.csv).
+   Entries where those IDs are absent are omitted from the recipe and logged.
 
 """
 
@@ -162,6 +165,7 @@ class ConnectivityBuilder:
         mapping_table: CableMappingTable,
         output_dir: str = "./vast_export",
         syn_mechanism: str = _DEFAULT_SYN_MECHANISM,
+        cell_mechanisms: Optional[Dict[str, List[str]]] = None,
     ) -> Tuple[ConnectivityOutput, str, str]:
         """
         Build connectivity table and Arbor recipe.
@@ -221,7 +225,7 @@ class ConnectivityBuilder:
         # Write Arbor recipe JSON
         recipe_path = str(Path(output_dir) / "arbor_recipe.json")
         self._write_arbor_recipe(
-            connectivity, swc_paths, registry, recipe_path, syn_mechanism
+            connectivity, swc_paths, registry, recipe_path, syn_mechanism, cell_mechanisms
         )
         self.logger.info(f"Written: {recipe_path}")
 
@@ -270,7 +274,7 @@ class ConnectivityBuilder:
             dist_post      = post_syn_map.distance_um
         else:
             # Fall back: look for the POST_SYN cell directly in trees
-            post_cell      = conn_row.post_cell_name
+            post_cell      = conn_row.post_syn_name
             post_swc       = swc_paths.get(conn_row.post_syn_name, "")
             post_edge_u    = -1
             post_edge_v    = -1
@@ -371,6 +375,7 @@ class ConnectivityBuilder:
         registry: SegmentRegistry,
         path: str,
         syn_mechanism: str,
+        cell_mechanisms: Optional[Dict[str, List[str]]] = None,
     ) -> None:
         """
         Write arbor_recipe.json.
@@ -378,14 +383,16 @@ class ConnectivityBuilder:
         Schema
         ------
         {
-          "cell_labels": {
-            "A1": "swc/cell_A1.swc",
-            ...
+          "metadata": {
+            "coord_frame": "physical_um_xyz_center",
+            "branch_id_convention": "swc_row_id"
           },
+          "cell_labels": {"A1": "swc/cell_A1.swc", ...},
+          "cell_mechanisms": {"A1": ["hh", "pas"], ...},   // only if provided
           "synapses": [
             {
-              "pre":  {"cell": "A1", "branch": <edge_u>, "pos": <arc_frac>},
-              "post": {"cell": "A1B1P1", "branch": <edge_u>, "pos": <arc_frac>},
+              "pre":  {"cell": "A1", "branch": <swc_row_id>, "pos": <arc_frac>},
+              "post": {"cell": "A1B1P1", "branch": <swc_row_id>, "pos": <arc_frac>},
               "mechanism": "expsyn",
               "synapse_name": "A1B1P1S1",
               "bouton_name":  "A1B1"
@@ -394,13 +401,16 @@ class ConnectivityBuilder:
           ],
           "contacts": [
             {
-              "pre":  {"cell": "A1", "branch": <edge_u>, "pos": <arc_frac>},
+              "pre":  {"cell": "A1", "branch": <swc_row_id>, "pos": <arc_frac>},
               "contact_name": "A1B1X1",
               "bouton_name":  "A1B1"
             },
             ...
           ]
         }
+
+        branch is the SWC row ID from pre_swc_u / post_swc_u in connectivity.csv.
+        Rows where those IDs are None or -1 are omitted and logged as warnings.
         """
         # Cell labels: all cells with a known SWC path
         cell_labels = {
@@ -410,18 +420,35 @@ class ConnectivityBuilder:
 
         synapses = []
         contacts = []
+        n_pre_unmappable = 0
+        n_post_unmappable = 0
 
         for row in connectivity.rows:
+            if row.pre_swc_u is None or row.pre_swc_u == -1:
+                self.logger.warning(
+                    f"  Recipe: {row.synapse_name} pre side has no SWC node "
+                    f"(pre_edge_u={row.pre_edge_u}) -- omitted from recipe"
+                )
+                n_pre_unmappable += 1
+                continue
+
             pre_loc = {
                 "cell":   row.pre_cell,
-                "branch": row.pre_edge_u,
+                "branch": row.pre_swc_u,
                 "pos":    round(row.pre_arc_frac, 6),
             }
 
             if row.connection_type == "synapse":
+                if row.post_swc_u is None or row.post_swc_u == -1:
+                    self.logger.warning(
+                        f"  Recipe: {row.synapse_name} post side has no SWC node "
+                        f"(post_edge_u={row.post_edge_u}) -- omitted from recipe"
+                    )
+                    n_post_unmappable += 1
+                    continue
                 post_loc = {
                     "cell":   row.post_cell,
-                    "branch": row.post_edge_u,
+                    "branch": row.post_swc_u,
                     "pos":    round(row.post_arc_frac, 6),
                 }
                 synapses.append({
@@ -435,89 +462,55 @@ class ConnectivityBuilder:
             elif row.connection_type == "contact":
                 contacts.append({
                     "pre":          pre_loc,
-                    "contact_name": row.synapse_name,   # contact_name stored here
+                    "contact_name": row.synapse_name,
                     "bouton_name":  row.bouton_name,
                 })
+
+        if n_pre_unmappable or n_post_unmappable:
+            self.logger.warning(
+                f"Recipe: {n_pre_unmappable} entries omitted (pre SWC node missing), "
+                f"{n_post_unmappable} entries omitted (post SWC node missing)"
+            )
 
         recipe = {
             "metadata": {
                 "coord_frame": "physical_um_xyz_center",
-                # branch/pos locations use graph node IDs, not SWC row IDs.
-                # pre_swc_u/v in connectivity.csv holds the SWC row IDs if needed.
-                "branch_id_convention": "graph_node_id",
+                "branch_id_convention": "swc_row_id",
             },
             "cell_labels": cell_labels,
             "synapses":    synapses,
             "contacts":    contacts,
         }
+        if cell_mechanisms:
+            recipe["cell_mechanisms"] = cell_mechanisms
 
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with open(path, 'w') as f:
             json.dump(recipe, f, indent=2)
+
+        syn_rows = [r for r in connectivity.rows if r.connection_type == "synapse"]
+        if syn_rows:
+            n_post_complete = sum(
+                1 for r in syn_rows
+                if r.post_swc_u is not None and r.post_swc_u != -1
+            )
+            self.logger.info(
+                f"Post-side SWC coverage: {n_post_complete}/{len(syn_rows)} synapses "
+                f"have a mapped post_swc_u "
+                f"({100 * n_post_complete // len(syn_rows)}%)"
+            )
+
+        # Write companion Python recipe class for Arbor users
+        py_path = Path(path).with_suffix('.py')
+        _template = Path(__file__).parent.parent / "templates" / "arbor_recipe_template.py"
+        py_path.write_text(_template.read_text())
+        self.logger.info(f"Written: {py_path}")
 
         self.logger.info(
             f"Arbor recipe: {len(cell_labels)} cells, "
             f"{len(synapses)} synapses, {len(contacts)} contacts"
         )
     
-    def generate_arbor_recipe(
-    self,
-    registry: SegmentRegistry,
-    trees: Dict[str, Tuple[nx.DiGraph, str]],
-    output_path: str
-    ) -> dict:
-        """
-        Generate Arbor-compatible recipe JSON.
-        
-        Uses connectivity from registry, doesn't require cable mappings.
-        """
-        recipe = {
-            "cells": [],
-            "connections": []
-        }
-        
-        # Add cells (all AXON and POST_SYN that have trees)
-        gid_map = {}  # name -> gid
-        gid = 0
-        
-        for name in sorted(trees.keys()):
-            info = registry.segments.get(name)
-            if not info:
-                continue
-            
-            tree, swc_path = trees[name]
-            
-            recipe["cells"].append({
-                "gid": gid,
-                "name": name,
-                "role": info.role,
-                "swc_file": swc_path,
-            })
-            
-            gid_map[name] = gid
-            gid += 1
-        
-        # Add connections from connectivity table
-        for row in registry.connectivity:
-            if row.axon_name not in gid_map or row.post_syn_name not in gid_map:
-                continue  # Skip if either cell missing
-            
-            recipe["connections"].append({
-                "source_gid": gid_map[row.axon_name],
-                "target_gid": gid_map[row.post_syn_name],
-                "source_label": "axon",
-                "target_label": "dendrite",
-                "synapse_name": row.synapse_name,
-                "weight": 1.0,
-                "delay": 0.5,  # ms
-            })
-        
-        # Write JSON
-        with open(output_path, 'w') as f:
-            json.dump(recipe, f, indent=2)
-        
-        return recipe
-
     # ------------------------------------------------------------------
     # Analysis
     # ------------------------------------------------------------------
@@ -670,6 +663,6 @@ class ConnectivityBuilder:
 
         Path(report_path).write_text('\n'.join(L))
 
-        self.logger.info(f"Written: {summary_path}")
-        self.logger.info(f"Written: {report_path}")
+        # self.logger.info(f"Written: {summary_path}")
+        # self.logger.info(f"Written: {report_path}")
         return summary_path, report_path
