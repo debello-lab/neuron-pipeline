@@ -313,7 +313,7 @@ class ConnectivityBuilder:
             pre_qc_flag=getattr(bouton_map,   'qc_distance_flag', 'ok'),
             pre_swc_u=getattr(bouton_map,     'swc_node_u', None),
             pre_swc_v=getattr(bouton_map,     'swc_node_v', None),
-            post_qc_flag=getattr(post_syn_map, 'qc_distance_flag', 'ok') if post_syn_map else 'ok',
+            post_qc_flag=getattr(post_syn_map, 'qc_distance_flag', 'ok') if post_syn_map else 'no_skeleton',
             post_swc_u=getattr(post_syn_map,   'swc_node_u', None)       if post_syn_map else None,
             post_swc_v=getattr(post_syn_map,   'swc_node_v', None)       if post_syn_map else None,
         )
@@ -622,7 +622,7 @@ class ConnectivityBuilder:
                 L.append(
                     f"    {r.synapse_name:<18}"
                     f"  pre {r.distance_pre_um:.2f} um [{r.pre_qc_flag}]"
-                    f"  post {r.distance_post_um:.2f} um [{r.post_qc_flag}]"
+                    f"  post {'no skeleton' if r.distance_post_um < 0 else f'{r.distance_post_um:.2f} um'} [{r.post_qc_flag}]"
                 )
 
         section("CONTACTS (unconfirmed)")

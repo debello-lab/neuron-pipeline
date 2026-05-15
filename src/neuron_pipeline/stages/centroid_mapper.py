@@ -30,6 +30,7 @@ To find the nearest cable point we:
 
 import csv
 import logging
+import re
 import numpy as np
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -246,69 +247,53 @@ class CentroidMapper:
     ) -> CableMappingTable:
         """
         Map all centroids in *centroid_table* to their nearest skeleton edge.
-        Also maps POST_SYN segment bounding-box centers onto their own skeletons.
+
+        Two passes are performed:
+
+        Pass 1 -- Primary mapping (BOUTON, SYNAPSE, CONTACT -> AXON skeleton):
+            Each centroid is projected onto the skeleton of its parent axon cell,
+            derived from the segment naming convention via _resolve_parent_cell().
+
+        Pass 2 -- Post-side mapping (SYNAPSE -> POST_SYN skeleton):
+            Each SYNAPSE centroid is also projected onto the POST_SYN skeleton
+            derived from the synapse name (A1B1P1S1 -> POST_SYN A1B1P1).
+            The SYNAPSE coordinate is used as the contact point, not the POST_SYN
+            bounding-box centre. This produces the anatomically correct post-side
+            cable location for the Arbor recipe.
+
         Args:
             centroid_table   : Output of Phase 2.
             trees            : Output of Phase 1 -- dict: cell_name -> (tree, swc_path).
             registry         : SegmentRegistry from Phase 0.
-            warn_distance_um : Log a warning when the nearest point is further
-                               than this value (possible mis-assignment).
-            extra_entries    : Optional list of additional CentroidEntry objects
+            ok_distance_um   : Distance threshold below which a mapping is flagged 'ok'.
+            warn_distance_um : Distance threshold above which a mapping is flagged 'suspicious'.
+            extra_entries    : Optional additional CentroidEntry objects to include in Pass 1.
 
         Returns:
-            CableMappingTable with one entry per centroid.
+            CableMappingTable with entries from both passes.
         """
-        # --- Coordinate frame validation ---
-        # Both Phase 1 (skeleton trees) and Phase 2 (centroids) tag their
-        # outputs with a coord_frame string. Assert they match before any
-        # spatial work is done. A mismatch here (e.g. voxel vs physical space)
-        # would corrupt all arc-fraction and distance outputs silently.
+        # Validate coordinate frames before any spatial work.
+        # A mismatch (e.g. voxel vs physical space) would corrupt all outputs silently.
         self._assert_frame_consistency(centroid_table, trees)
 
-        # Pre-build spatial indices -- one per skeleton tree
+        # Build one spatial index per skeleton tree.
         self.logger.info(f"Building spatial indices for {len(trees)} skeleton trees...")
         indices: Dict[str, _TreeIndex] = {
             name: _TreeIndex(tree)
             for name, (tree, _) in trees.items()
         }
-
-        # Log skeleton bounding boxes once so mismatches are visible in logs.
         self._log_skeleton_bounds(trees)
 
-        post_syn_entries = []
-        for name, info in registry.segments.items():
-            if info.role != 'POST_SYN':
-                continue
-            if name not in trees:
-                continue # no skeleton for this cell
-            bbox = info.bbox
-            if not bbox or len(bbox) < 6 or bbox[0] < 0:
-                continue
-            # use bbox center in voxels; need um
-            tree_graph ,_ = trees[name]
-            roots = [n for n in tree_graph.nodes() if tree_graph.in_degree(n) == 0]
-            if not roots:
-                continue
-            root_pos = tree_graph.nodes[roots[0]]['pos']
-            post_syn_entries.append(CentroidEntry(
-                name=name,
-                seg_id=info.seg_id,
-                role='POST_SYN',
-                cx_um=float(root_pos[0]),
-                cy_um=float(root_pos[1]),
-                cz_um=float(root_pos[2]),
-                method='root_proxy',
-            ))
-
-        all_entries = list(centroid_table.entries) + post_syn_entries + (extra_entries or [])
-
         mapping_table = CableMappingTable()
+
+        # ------------------------------------------------------------------
+        # Pass 1: map BOUTON / SYNAPSE / CONTACT centroids onto the AXON skeleton.
+        # ------------------------------------------------------------------
+        all_entries = list(centroid_table.entries) + (extra_entries or [])
         n_ok = n_no_tree = n_no_cell = 0
 
         for entry in all_entries:
-            result = self._map_one(
-                entry, indices, registry, ok_distance_um, warn_distance_um
-            )
+            result = self._map_one(entry, indices, registry, ok_distance_um, warn_distance_um)
             if result == 'no_cell':
                 n_no_cell += 1
             elif result == 'no_tree':
@@ -318,12 +303,55 @@ class CentroidMapper:
                 n_ok += 1
 
         self.logger.info(
-            f"Phase 3 complete: {n_ok} mapped, "
+            f"Phase 3 Pass 1: {n_ok} mapped, "
             f"{n_no_tree} skipped (no skeleton), "
             f"{n_no_cell} skipped (no parent cell in registry)"
         )
 
-        # QC summary: count per distance tier across all mapped entries
+        # ------------------------------------------------------------------
+        # Pass 2: map SYNAPSE centroids onto the POST_SYN skeleton.
+        # Each SYNAPSE entry produces a second mapping keyed by the POST_SYN
+        # cell name (e.g. A1B1P1S1 -> mapped onto A1B1P1 skeleton).
+        # _resolve_parent_cell handles POST_SYN role by returning (name, POST_SYN).
+        # ------------------------------------------------------------------
+        n_post_mapped = n_post_no_tree = 0
+
+        for entry in centroid_table.entries:
+            if entry.role != 'SYNAPSE':
+                continue
+
+            post_name = self._strip_synapse_suffix(entry.name)
+            self.logger.debug(
+                f"Post-side pass: {entry.name} -> post_name={post_name}, "
+                f"in_indices={post_name in indices if post_name else False}"
+            )
+
+            if post_name is None or post_name not in indices:
+                n_post_no_tree += 1
+                continue
+
+            proxy = CentroidEntry(
+                name=post_name,
+                seg_id=registry.segments[post_name].seg_id if post_name in registry.segments else -1,
+                role='POST_SYN',
+                cx_um=entry.cx_um,
+                cy_um=entry.cy_um,
+                cz_um=entry.cz_um,
+                method='synapse_proxy',
+            )
+            result = self._map_one(proxy, indices, registry, ok_distance_um, warn_distance_um)
+            if isinstance(result, CableMappingEntry):
+                mapping_table.add(result)
+                n_post_mapped += 1
+            else:
+                n_post_no_tree += 1
+
+        self.logger.info(
+            f"Phase 3 Pass 2: {n_post_mapped} SYNAPSE centroids mapped onto "
+            f"POST_SYN skeletons, {n_post_no_tree} skipped (no POST_SYN skeleton)"
+        )
+
+        # QC summary across all entries from both passes.
         qc_counts: Dict[str, int] = {'ok': 0, 'warn': 0, 'suspicious': 0}
         for e in mapping_table.entries:
             qc_counts[e.qc_distance_flag] = qc_counts.get(e.qc_distance_flag, 0) + 1
@@ -470,7 +498,6 @@ class CentroidMapper:
     @staticmethod
     def _axon_prefix(name: str) -> Optional[str]:
         """Extract the A<n> prefix from any segment name."""
-        import re
         m = re.match(r'^(A\d+)', name)
         return m.group(1) if m else None
 
@@ -551,3 +578,9 @@ class CentroidMapper:
                 f"Y [{lo[1]:.1f}, {hi[1]:.1f}]  "
                 f"Z [{lo[2]:.1f}, {hi[2]:.1f}]"
             )
+
+    @staticmethod
+    def _strip_synapse_suffix(name: str) -> Optional[str]:
+        """A1B1P1S1 -> A1B1P1, returns None if name does not match."""
+        m = re.match(r'^(A\d+B\d+P\d+)S\d+$', name)
+        return m.group(1) if m else None

@@ -372,12 +372,12 @@ def _write_pipeline_report(
         ("arbor_recipe.json",       False),
         ("review_queue.csv",        False),
         ("stats/skeleton_stats.csv",False),
-        ("pipeline_report.txt",     True),
     ]
     for fname, is_dir in check:
         p = Path(output_dir) / fname
         exists = p.is_dir() if is_dir else p.exists()
         L.append(f"  [{'OK    ' if exists else 'MISSING'}]  {fname}")
+    L.append(f"  [OK    ]  pipeline_report.txt")
 
     L += ["", "=" * W, ""]
     path.write_text('\n'.join(L))
@@ -954,6 +954,11 @@ def _parse_args() -> argparse.Namespace:
         "--segment", "--segments", nargs="+", metavar="NAME", dest="segments",
         help="Process only the named segments, e.g. --segment A1 A1B2P1.",
     )
+    p.add_argument(
+        "--skip", nargs="+", metavar="NAME",
+        dest="skip_segments",
+        help="Skip the named segments, e.g. --skip A1P1", 
+    )
 
     # Logging
     p.add_argument(
@@ -962,7 +967,10 @@ def _parse_args() -> argparse.Namespace:
         help="Console log verbosity (default: INFO). File log is always DEBUG.",
     )
 
-    return p.parse_args()
+    args = p.parse_args()
+    if args.segments and args.skip_segments:
+        p.error("--segment and --skip are mutually exclusive")
+    return args
 
 
 def _resolve_active_phases(args: argparse.Namespace) -> frozenset:
@@ -981,6 +989,20 @@ def _resolve_active_phases(args: argparse.Namespace) -> frozenset:
 # ---------------------------------------------------------------------------
 # Disk loaders used by --from-phase and --resume
 # ---------------------------------------------------------------------------
+
+def _parse_swc_header(swc_path) -> dict:
+    """Return all key: value pairs from leading SWC comment lines."""
+    attrs = {}
+    with open(swc_path) as f:
+        for line in f:
+            if not line.startswith('#'):
+                break
+            line = line[1:].strip()
+            if ':' in line:
+                key, _, value = line.partition(':')
+                attrs[key.strip()] = value.strip()
+    return attrs
+
 
 def _load_single_swc(swc_path: str) -> nx.DiGraph:
     """Reconstruct an nx.DiGraph from a single SWC file.
@@ -1021,6 +1043,9 @@ def _load_single_swc(swc_path: str) -> nx.DiGraph:
 
     for n in G.nodes():
         G.nodes[n]['degree'] = G.degree(n)
+
+    for key, value in _parse_swc_header(swc_path).items():
+        G.graph[key] = value
 
     return G
 
@@ -1145,15 +1170,12 @@ def main():
     args = _parse_args()
     output_dir = args.output_dir
     active = _resolve_active_phases(args)
-    only_segments: Optional[set] = set(args.segments) if args.segments else None
     console_level = getattr(logging, args.log_level)
 
     logger = setup_pipeline_logger(output_dir, console_level=console_level)
-    logger.info(
-        f"Pipeline starting  phases={sorted(active)}  output={output_dir}"
-        + (f"  segments={sorted(only_segments)}" if only_segments else "")
-    )
+    
 
+    
     # Phase 0: always run -- downstream phases need the SegmentRegistry
     classifier = SegmentClassifier()
     registry = classifier.classify_segments()
@@ -1161,6 +1183,18 @@ def main():
     if not registry.segments:
         logger.error("Phase 0: registry is empty -- aborting")
         return
+    
+    if args.segments:
+        only_segments: Optional[set] = set(args.segments)
+    elif args.skip_segments:
+        only_segments = {name for name in registry.segments if name not in set(args.skip_segments)}
+    else:
+        only_segments = None
+
+    logger.info(
+        f"Pipeline starting  phases={sorted(active)}  output={output_dir}"
+        + (f"  segments={sorted(only_segments)}" if only_segments else "")
+    )
 
     # ------------------------------------------------------------------
     # Phase 1
