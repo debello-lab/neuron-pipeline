@@ -46,9 +46,6 @@ class CentroidEntry:
     cy_um: float
     cz_um: float
     method: str                      # voxel | bbox_fallback | anchor
-    # Coordinate frame tag -- must match the skeleton tree's coord_frame
-    # attribute set in Phase 1 (graph_to_tree). Phase 3 asserts equality
-    # before building the KDTree to catch silent space mismatches.
     coord_frame: str = 'physical_um_xyz_center'
 
 

@@ -11,4 +11,5 @@ numpy
 scipy
 scikit-image
 networkx
+crackle-codec
 kimimaro
