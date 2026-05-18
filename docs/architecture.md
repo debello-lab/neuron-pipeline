@@ -38,6 +38,8 @@ ms-neuron-pipeline/
 |   |   | +--- VASTControlClass.py
 |   +--- neuron_pipeline/
 |   | +--- main_pipeline.py
+|   | +--- templates/
+|   |   | +--- arbor_recipe_template.py
 |   | +--- stages/
 |   |   | +--- centroid_extraction.py
 |   |   | +--- centroid_mapper.py
@@ -85,7 +87,7 @@ ms-neuron-pipeline/
     - Join SYNAPSE and CONTACT annotations with their pre- and post-synaptic cable locations from Phase 3.
     - Build full edge list: `(pre_cell, pre_edge, pre_arc_frac, post_cell, post_edge, post_arc_frac, synapse/contact identifiers)`.
     - Write Arbor-ready network recipe (JSON) and a human-readable connectivity report.
-    - Output: `connectivity.csv`, `connectivity_summary.csv`, `connectivity_report.txt`, `arbor_recipe.json`.
+    - Output: `connectivity.csv`, `connectivity_summary.csv`, `connectivity_report.txt`, `arbor_recipe.json`, `arbor_recipe.py`.
 
 
 The main artifacts written to disk are under `./vast_export/`:
@@ -99,6 +101,7 @@ The main artifacts written to disk are under `./vast_export/`:
 | `connectivity_summary.csv` | 4 | Per-(axon, post_syn) pair synapse counts and distance stats |
 | `connectivity_report.txt` | 4 | Human-readable connectivity summary with QC warnings |
 | `arbor_recipe.json` | 4 | Arbor-ready network description |
+| `arbor_recipe.py` | 4 | Arbor Python recipe class (`ReconstructedRecipe`) — load alongside the JSON |
 | `review_queue.csv` | 1 | Segments flagged for manual inspection (high closing fraction or residual fragmentation) |
 | `logs/pipeline_<timestamp>.log` | all | Full pipeline log (DEBUG level) |
 
@@ -209,7 +212,7 @@ Joins annotation wiring from the registry with Phase 1/3 cable locations.
 
 **Responsibilities:**
 - Look up pre- and post-synaptic cable positions from the mapping table.
-- Write `connectivity.csv` and `arbor_recipe.json`.
+- Write `connectivity.csv`, `arbor_recipe.json`, and `arbor_recipe.py`.
 - Write `connectivity_summary.csv` (per-pair synapse counts, distance stats, QC tallies) and `connectivity_report.txt` (human-readable, includes missing-connection warnings).
 
 ---
@@ -383,7 +386,8 @@ Defines the high-level control flow and exposes a CLI via `argparse`:
 | `--spur-length-um F` | Phase 1 spur-pruning threshold in µm (default: 2.0) |
 | `--warn-distance-um F` | Phase 3 mapping-distance warning threshold in µm (default: 5.0) |
 | `--syn-mechanism NAME` | Arbor synapse mechanism name for Phase 4 (default: `expsyn`) |
-| `--segment NAME [...]` | Process only the named segments |
+| `--segment NAME [...]` | Process only the named segments (mutually exclusive with `--skip`) |
+| `--skip NAME [...]` | Skip the named segments (mutually exclusive with `--segment`) |
 | `--log-level LEVEL` | Console log verbosity: `DEBUG` / `INFO` / `WARNING` / `ERROR` |
 
 ### `scripts/run_pipeline.py`

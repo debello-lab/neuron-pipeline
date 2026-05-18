@@ -32,32 +32,31 @@ Expected structure:
 
 ```text
 ms-neuron-pipeline/
-  LICENSE
-  pyproject.toml
-  README.md
-  docs/
-    architecture.md
-    setup.md
-  scripts/
-    run_pipeline.py
-  src/
-    neuron_pipeline/
-      __init__.py
-      main_pipeline.py
-      stages/
-        centroid_extraction.py
-        centroid_mapper.py
-        connectivity_builder.py
-        extract_surfaces.py
-        segment_classifier.py
-        skeletonization.py
-        voxel_cleaning.py
-    vastpy/
-      __init__.py
-      control/
-        __init__.py
-        VASTControlClass.py
-        exporting.py
++--- src/
+|   +--- vastpy/
+|   | +--- control/
+|   |   | +--- exporting.py 
+|   |   | +--- VASTControlClass.py
+|   +--- neuron_pipeline/
+|   | +--- main_pipeline.py
+|   | +--- templates/
+|   |   | +--- arbor_recipe_template.py
+|   | +--- stages/
+|   |   | +--- centroid_extraction.py
+|   |   | +--- centroid_mapper.py
+|   |   | +--- connectivity_builder.py
+|   |   | +--- extract_surfaces.py
+|   |   | +--- segment_classifier.py
+|   |   | +--- skeletonization.py
+|   |   | +--- voxel_cleaning.py
++--- scripts/
+|   +--- run_pipeline.py
++--- docs/
+|   +--- architecture.md
+|   +--- setup.md
++--- LICENSE
++--- pyproject.toml
++--- README.md
 ```
 
 ## 1) Install (recommended)
@@ -104,7 +103,7 @@ python -c "import neuron_pipeline; import vastpy; print('Imports OK')"
 ```
 If this fails, check the following:
 - pyproject.toml exists in the repo root
-- __init__.py exists in:
+- \_\_init\_\_.py exists in:
     - src/neuron_pipeline/
     - src/neuron_pipeline/stages/
     - src/vastpy/
@@ -147,14 +146,57 @@ python -m neuron_pipeline.main_pipeline [OPTIONS]
 
 Common flags:
 
+**Phase control** (mutually exclusive)
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--phases N [N ...]` | all | Run only the listed phase numbers (0–4). E.g. `--phases 1 2` |
+| `--from-phase N` | — | Run phases N through 4, loading earlier outputs from disk. Phase 0 always re-runs. |
+
+**Output / I/O**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--output-dir DIR` | `./vast_export` | Base output directory |
+| `--resume` | off | Phase 1: skip segments that already have a `.swc` on disk |
+
+**Segment filter** (mutually exclusive)
+
 | Flag | Description |
 |------|-------------|
-| `--phases 1` | Run only Phase 1 |
-| `--from-phase 2` | Resume from Phase 2 using existing Phase 1 outputs |
-| `--segment A1 A2` | Process only named segments |
-| `--spur-length-um 2.0` | Spur pruning threshold (µm) |
-| `--resume` | Skip segments that already have a `.swc` on disk |
-| `--output-dir ./vast_export` | Output directory |
+| `--segment NAME [NAME ...]` | Process only the named segments. E.g. `--segment A1 A1B2P1` |
+| `--skip NAME [NAME ...]` | Skip the named segments. E.g. `--skip A1P1` |
+
+**Phase 1 — skeletonization**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--miplevel-skel N` | `1` | MIP level for voxel extraction (0 = full res) |
+| `--spur-length-um F` | `2.0` | Spur-pruning threshold in µm |
+
+**Phase 2 — centroid extraction**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--miplevel-centroid N` | `1` | MIP level for centroid voxel extraction |
+
+**Phase 3 — cable mapping**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--warn-distance-um F` | `5.0` | Warning threshold for centroid-to-cable distance in µm |
+
+**Phase 4 — connectivity**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--syn-mechanism NAME` | `expsyn` | Arbor synapse mechanism name written into the recipe |
+
+**Logging**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--log-level LEVEL` | `INFO` | Console verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR`. File log is always `DEBUG`. |
 
 Single-segment diagnostic:
 

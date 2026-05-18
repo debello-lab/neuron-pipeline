@@ -99,6 +99,7 @@ vast_export/
 ├── connectivity_summary.csv Per axon–POST_SYN pair statistics
 ├── connectivity_report.txt  Plain-text connectivity report with QC flags
 ├── arbor_recipe.json        Arbor-ready network description
+├── arbor_recipe.py          Arbor Python recipe class (ReconstructedRecipe)
 ├── review_queue.csv         Segments flagged for manual inspection
 ├── pipeline_report.txt      Single-page summary of the full run
 └── logs/
@@ -120,6 +121,8 @@ ms-neuron-pipeline/
 │   │       └── VASTControlClass.py
 │   └── neuron_pipeline/         Application layer
 │       ├── main_pipeline.py     Pipeline orchestrator
+│       ├── templates/
+│       │   └── arbor_recipe_template.py
 │       └── stages/
 │           ├── segment_classifier.py
 │           ├── extract_surfaces.py
