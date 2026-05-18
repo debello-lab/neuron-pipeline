@@ -386,7 +386,8 @@ Defines the high-level control flow and exposes a CLI via `argparse`:
 | `--spur-length-um F` | Phase 1 spur-pruning threshold in µm (default: 2.0) |
 | `--warn-distance-um F` | Phase 3 mapping-distance warning threshold in µm (default: 5.0) |
 | `--syn-mechanism NAME` | Arbor synapse mechanism name for Phase 4 (default: `expsyn`) |
-| `--segment NAME [...]` | Process only the named segments |
+| `--segment NAME [...]` | Process only the named segments (mutually exclusive with `--skip`) |
+| `--skip NAME [...]` | Skip the named segments (mutually exclusive with `--segment`) |
 | `--log-level LEVEL` | Console log verbosity: `DEBUG` / `INFO` / `WARNING` / `ERROR` |
 
 ### `scripts/run_pipeline.py`
