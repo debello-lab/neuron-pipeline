@@ -462,7 +462,7 @@ def run_phase1(
     # Closing fraction threshold: warn if closing added >20% of original volume.
     # A large fraction means the closing radius is bridging more than surface gaps.
     # Flagged segments are written to review_queue.csv for human inspection.
-    CLOSING_FRACTION_WARN = 0.70
+    CLOSING_FRACTION_WARN = 0.20
 
     for name, info in targets:
         logger.info(f"--- {info.role} {name} (seg {info.seg_id}) ---")
@@ -507,28 +507,26 @@ def run_phase1(
                     bbox_min_vox=bbox_min,
             )
 
-            # Check how much volume closing added relative to original.
-            # A high fraction means the radius is doing more than gap-bridging.
             closing_fraction = stats['closing_voxels_added'] / max(original_voxels, 1)
             if closing_fraction > CLOSING_FRACTION_WARN:
                 msg = (
                     f"Closing added {closing_fraction*100:.1f}% of original volume "
-                    f"({stats['closing_voxels_added']:,} vox). "
-                    f"Closing radius may be too large or segment has large surface gaps. "
+                    f"({stats['closing_voxels_added']:,} vox) — skeleton would be unreliable."
                 )
                 log_warning_box(logger, "CLEANING", name, msg)
-                warnings.append(WarningRecord(name, "cleaning", msg, "medium"))
                 review_queue_entries.append({
-                    'segment_name':         name,
-                    'segment_id':           info.seg_id,
-                    'role':                 info.role,
-                    'reason':               'high_closing_fraction',
-                    'closing_radius_um':    0.05,
-                    'original_voxels':      original_voxels,
-                    'closing_voxels_added': stats['closing_voxels_added'],
-                    'closing_fraction':     round(closing_fraction, 4),
+                    'segment_name':           name,
+                    'segment_id':             info.seg_id,
+                    'role':                   info.role,
+                    'reason':                 'excessive_closing',
+                    'closing_radius_um':      0.05,
+                    'original_voxels':        original_voxels,
+                    'closing_voxels_added':   stats['closing_voxels_added'],
+                    'closing_fraction':       round(closing_fraction, 4),
                     'components_after_clean': stats['original_components'],
                 })
+                failures.append(FailureRecord(name, info.seg_id, info.role, "phase1", "cleaning", "excessive_closing", {'closing_fraction': closing_fraction}))
+                continue
 
             if stats['original_components'] > 1:
                 logger.warning(

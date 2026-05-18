@@ -39,7 +39,7 @@ import kimimaro
 import networkx as nx
 import logging
 
-from scipy.ndimage import distance_transform_edt
+import edt as _edt
 from typing import Dict, Any, List, Optional, Tuple
 
 
@@ -261,7 +261,7 @@ class SkeletonExtractor:
 
         # --- Radius estimation via EDT ---------------------------------------
         # sampling=(sz, sy, sx) must match mask axis order (Z, Y, X)
-        dist_um = distance_transform_edt(mask.astype(bool), sampling=anisotropy)
+        dist_um = _edt.edt(mask.astype(bool), anisotropy=anisotropy) # EDT vs scipy edt uses float32 (~4 bytes/bbox voxel) vs scipy's float64 + three int64 index arrays (~32 bytes/bbox voxel)
 
         radius_floor = max(0.005, min(voxel_size_um) / 2.0)
 
