@@ -36,14 +36,28 @@ class ReconstructedRecipe(arbor.recipe):
 
     def cell_description(self, gid):
         name = self._cell_list[gid]
-        tree = arbor.load_swc_arbor(self._data["cell_labels"][name])
+        loaded = arbor.load_swc_arbor(self._data["cell_labels"][name])
+        tree = loaded.morphology
         dec = arbor.decor()
 
         for mech in self._data.get("cell_mechanisms", {}).get(name, []):
             dec.paint("(all)", arbor.density(mech))
 
+        for i, stim in enumerate(self._data.get("stimuli", {}).get(name, [])):
+            dec.place(
+                '"root"',
+                arbor.iclamp(
+                    stim["tstart"]   * arbor.units.ms,
+                    stim["duration"] * arbor.units.ms,
+                    stim["current"]  * arbor.units.nA,
+                ),
+                f"iclamp_{i}",
+            )
+
+        labels = arbor.label_dict(loaded.labels)
+        labels["root"] = "(root)"
         # Threshold detector so this cell can act as a pre-synaptic source.
-        dec.place('"root"', arbor.threshold_detector(-10), "detector")
+        dec.place('"root"', arbor.threshold_detector(-10 * arbor.units.mV), "detector")
 
         # Place a synapse target for every incoming connection onto this cell.
         # Location '"root"' is a placeholder -- see module docstring.
@@ -51,7 +65,10 @@ class ReconstructedRecipe(arbor.recipe):
             label = f'syn_{syn["synapse_name"]}'
             dec.place('"root"', arbor.synapse(syn["mechanism"]), label)
 
-        return arbor.cable_cell(tree, dec)
+        return arbor.cable_cell(tree, dec, labels)
+
+    def global_properties(self, kind):
+        return arbor.neuron_cable_properties()
 
     def connections_on(self, gid):
         name = self._cell_list[gid]
@@ -60,9 +77,9 @@ class ReconstructedRecipe(arbor.recipe):
             src_gid = self._cell_list.index(syn["pre"]["cell"])
             target_label = f'syn_{syn["synapse_name"]}'
             conns.append(arbor.connection(
-                (src_gid, "detector"),
-                target_label,
+                arbor.cell_global_label(src_gid, "detector"),
+                arbor.cell_local_label(target_label),
                 weight=1.0,
-                delay=0.5,
+                delay=0.5 * arbor.units.ms,
             ))
         return conns

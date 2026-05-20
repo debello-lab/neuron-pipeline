@@ -376,6 +376,7 @@ class ConnectivityBuilder:
         path: str,
         syn_mechanism: str,
         cell_mechanisms: Optional[Dict[str, List[str]]] = None,
+        stimuli: Optional[Dict[str, List[dict]]] = None,
     ) -> None:
         """
         Write arbor_recipe.json.
@@ -388,7 +389,8 @@ class ConnectivityBuilder:
             "branch_id_convention": "swc_row_id"
           },
           "cell_labels": {"A1": "swc/cell_A1.swc", ...},
-          "cell_mechanisms": {"A1": ["hh", "pas"], ...},   // only if provided
+          "cell_mechanisms": {"A1": ["hh"], ...},
+          "stimuli": {"A1": [{"tstart": 5, "duration": 3, "current": 0.5}], ...},
           "synapses": [
             {
               "pre":  {"cell": "A1", "branch": <swc_row_id>, "pos": <arc_frac>},
@@ -414,7 +416,7 @@ class ConnectivityBuilder:
         """
         # Cell labels: all cells with a known SWC path
         cell_labels = {
-            name: str(Path(swc_path).name)
+            name: "swc/" + str(Path(swc_path).name)
             for name, swc_path in swc_paths.items()
         }
 
@@ -472,17 +474,27 @@ class ConnectivityBuilder:
                 f"{n_post_unmappable} entries omitted (post SWC node missing)"
             )
 
+        if cell_mechanisms is None:
+            cell_mechanisms = {name: ["hh"] for name in cell_labels}
+
+        if stimuli is None:
+            pre_cells = sorted({s["pre"]["cell"] for s in synapses})
+            stimuli = {
+                cell: [{"tstart": 5, "duration": 3, "current": 0.5}]
+                for cell in pre_cells
+            }
+
         recipe = {
             "metadata": {
                 "coord_frame": "physical_um_xyz_center",
                 "branch_id_convention": "swc_row_id",
             },
-            "cell_labels": cell_labels,
-            "synapses":    synapses,
-            "contacts":    contacts,
+            "cell_labels":     cell_labels,
+            "cell_mechanisms": cell_mechanisms,
+            "stimuli":         stimuli,
+            "synapses":        synapses,
+            "contacts":        contacts,
         }
-        if cell_mechanisms:
-            recipe["cell_mechanisms"] = cell_mechanisms
 
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with open(path, 'w') as f:
