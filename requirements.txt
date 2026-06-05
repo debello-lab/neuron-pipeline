@@ -1,16 +1,12 @@
 # ms-neuron-pipeline dependencies
-# Python >= 3.10 required
+# Python >= 3.12 required
 #
-# Install third-party dependencies:
-#   pip install -r requirements.txt
-#
-# Then install the local packages in editable mode:
-#   pip install -e .
+# Managed via uv — use `uv sync` rather than pip install -r.
+# This file is kept for reference; pyproject.toml is authoritative.
 
 numpy
 scipy
 scikit-image
 networkx
 crackle-codec
-kimimaro
 edt
