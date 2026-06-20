@@ -223,7 +223,11 @@ def main():
     parser = argparse.ArgumentParser(description='View an SWC skeleton file in 3D.')
     parser.add_argument(
         'swc', nargs='?',
-        help='Path to .swc file. Defaults to the newest file in diag_output/.',
+        help='Path to an .swc file. Defaults to the newest file in diag_output/.',
+    )
+    parser.add_argument(
+        '--dir', dest='swc_dir',
+        help='Directory containing .swc files. Loads the newest .swc inside.',
     )
     parser.add_argument(
         '--color-by', choices=['type', 'radius'], default='type',
@@ -231,7 +235,21 @@ def main():
     )
     args = parser.parse_args()
 
-    if args.swc:
+    if args.swc_dir and args.swc:
+        parser.error('Cannot specify both a SWC file and --dir.')
+
+    if args.swc_dir:
+        swc_dir = Path(args.swc_dir)
+        if not swc_dir.exists() or not swc_dir.is_dir():
+            print(f"Directory not found: {swc_dir}")
+            sys.exit(1)
+        swc_files = sorted(swc_dir.glob('**/*.swc'), key=lambda p: p.stat().st_mtime)
+        if not swc_files:
+            print(f"No .swc files found in directory: {swc_dir}")
+            sys.exit(1)
+        swc_path = swc_files[-1]
+        print(f"Directory specified -- loading newest .swc: {swc_path.name}")
+    elif args.swc:
         swc_path = Path(args.swc)
     else:
         diag_dir  = Path(__file__).parent.parent / 'diag_output'

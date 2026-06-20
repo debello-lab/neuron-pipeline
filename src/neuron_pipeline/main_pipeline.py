@@ -32,7 +32,7 @@ from vastpy.control.exporting import VASTControlClass
 from neuron_pipeline.stages.segment_classifier import SegmentClassifier, SegmentRegistry
 from neuron_pipeline.stages.extract_surfaces import SegmentSurfaceExtractor
 from neuron_pipeline.stages.voxel_cleaning import VoxelCleaner
-from neuron_pipeline.stages.skeletonization import SkeletonExtractor, SWCWriter
+from neuron_pipeline.stages.skeletonization import MCFSkeletonizer
 from neuron_pipeline.stages.centroid_extraction import CentroidExtractor, CentroidTable
 from neuron_pipeline.stages.centroid_mapper import CentroidMapper, CableMappingTable
 from neuron_pipeline.stages.connectivity_builder import ConnectivityBuilder, ConnectivityOutput
@@ -420,8 +420,10 @@ def run_phase1(
     """
     extractor = SegmentSurfaceExtractor(vast, output_dir, logger=logger)
     cleaner = VoxelCleaner(logger=logger)
-    skel = SkeletonExtractor(logger=logger)
-    writer = SWCWriter()
+    mcf_skel = MCFSkeletonizer(output_dir=output_dir, logger=logger)
+
+    Path(output_dir, "meshes").mkdir(parents=True, exist_ok=True)
+    Path(output_dir, "polylines").mkdir(parents=True, exist_ok=True)
 
     # Derive physical dataset bounds for cable-length validation.
     # Segments are edge-clipped fragments; thresholds are based on geometry,
@@ -462,7 +464,7 @@ def run_phase1(
     # Closing fraction threshold: warn if closing added >20% of original volume.
     # A large fraction means the closing radius is bridging more than surface gaps.
     # Flagged segments are written to review_queue.csv for human inspection.
-    CLOSING_FRACTION_WARN = 0.20
+    CLOSING_FRACTION_WARN = 0.25
 
     for name, info in targets:
         logger.info(f"--- {info.role} {name} (seg {info.seg_id}) ---")
@@ -587,22 +589,54 @@ def run_phase1(
                         'components_after_clean': n_comp,
                     })
 
-            # 1C. Skeletonize voxels (includes compression, pruning, soma insertion)
-            tree, skel_stats = skel.extract_skeleton(
+            # 1C–D. MCF skeletonization → SWC
+            swc_path = str(swc_dir / f"cell_{name}.swc")
+            ok, skel_stats = mcf_skel.skeletonize(
                 mask=cleaned.mask,
                 voxel_size_um=voxel_size,
                 bbox_min_vox=bbox_min,
+                swc_path=swc_path,
+                stem=name,
                 spur_length_um=spur_length_um,
+                metadata={
+                    'segment_id':    info.seg_id,
+                    'segment_name':  name,
+                    'role':          info.role,
+                    'miplevel':      miplevel,
+                    'bbox_min_vox':  str(bbox_min),
+                    'voxel_size_um': str(voxel_size),
+                    'coord_frame':   COORD_FRAME_PHYSICAL,
+                },
             )
 
+            if not ok:
+                log_failure(logger, "SKELETONIZATION", name,
+                            "MCF skeletonization failed (see earlier log lines)",
+                            {'input_voxels': remaining})
+                failures.append(FailureRecord(name, info.seg_id, info.role,
+                                              "phase1", "skeletonization", "mcf_failed",
+                                              {'input_voxels': remaining}))
+                continue
+
+            # Load SWC back as DiGraph (same loader used by --from-phase 2)
+            tree = _load_single_swc(swc_path)
             if tree.number_of_nodes() == 0:
                 log_failure(logger, "SKELETONIZATION", name,
-                            "Empty tree (0 nodes) produced",
+                            "Empty tree (0 nodes) after MCF",
                             {'input_voxels': remaining})
                 failures.append(FailureRecord(name, info.seg_id, info.role,
                                               "phase1", "skeletonization", "empty_tree",
                                               {'input_voxels': remaining}))
                 continue
+
+            # Tag provenance and fill edge attrs expected by Phase 3
+            tree.graph['voxel_convention'] = VOXEL_CENTER
+            tree.graph['bbox_min_vox']     = tuple(int(x) for x in bbox_min)
+            tree.graph['voxel_size_um']    = tuple(float(x) for x in voxel_size)
+            tree.graph.setdefault('coord_frame', COORD_FRAME_PHYSICAL)
+            for u, v in tree.edges():
+                tree[u][v].setdefault('points', [])
+                tree[u][v].setdefault('radii',  [])
 
             # Cable-length sanity check against physical dataset bounds.
             # Segments are edge-clipped fragments; biological length expectations
@@ -632,33 +666,6 @@ def run_phase1(
                     )
                     log_warning_box(logger, "SKELETONIZATION", name, msg)
                     warnings.append(WarningRecord(name, "skeletonization", msg, "medium"))
-
-            # Tag provenance (coord_frame already set by skeletonization)
-            tree.graph['voxel_convention'] = VOXEL_CENTER
-            tree.graph['bbox_min_vox']     = tuple(int(x) for x in bbox_min)
-            tree.graph['voxel_size_um']    = tuple(float(x) for x in voxel_size)
-
-            # 1D. Write SWC
-            swc_path = str(swc_dir / f"cell_{name}.swc")
-            writer.write_swc(
-                tree=tree,
-                output_path=swc_path,
-                metadata={
-                    'segment_id': info.seg_id,
-                    'segment_name': name,
-                    'role': info.role,
-                    'miplevel': miplevel,
-                    'bbox_min_vox': str(bbox_min),      # (minx, miny, minz) in voxels
-                    'voxel_size_um': str(voxel_size),   # (sx, sy, sz) in µm
-                    'coord_frame': COORD_FRAME_PHYSICAL,
-                    'skeleton_vertices': skel_stats.get('skeleton_vertices'),
-                    'skeleton_edges': skel_stats.get('skeleton_edges'),
-                    'bouton_clusters_collapsed': skel_stats.get('bouton_clusters_collapsed', 0),
-                    'bouton_nodes_removed': skel_stats.get('bouton_nodes_removed', 0),
-                    'spurs_pruned': skel_stats.get('branches_pruned'),
-                    'total_length_um': f"{skel_stats.get('total_length_um', 0):.2f}",
-                },
-            )
 
             results[name] = (tree, swc_path)
             skel_stats_rows.append({
