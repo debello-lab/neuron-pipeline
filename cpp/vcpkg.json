@@ -1,0 +1,9 @@
+{
+  "name": "neuromesh-cgal",
+  "version-string": "0.1.0",
+  "dependencies": [
+    "cgal",
+    "eigen3"
+  ],
+  "builtin-baseline": "0297aaaf1c7879d30af39d87dc484ba56bd7bbde"
+}

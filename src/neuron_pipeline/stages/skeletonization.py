@@ -35,12 +35,20 @@ Author: Nicolas Randazzo
 """
 
 import numpy as np
-import kimimaro
+# import kimimaro
 import networkx as nx
 import logging
+from mascaf import CGALOperator, MeshManager, SkeletonGraph, CableFitter, FitOptions
+from scipy.spatial import KDTree
+import trimesh
+import trimesh.repair
+from skimage import measure
 
 import edt as _edt
+from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
+import os
+
 
 
 class SkeletonExtractor:
@@ -223,6 +231,15 @@ class SkeletonExtractor:
 
         # anisotropy must match mask axis order (Z, Y, X)
         anisotropy = (sz, sy, sx)
+
+        try:
+            import kimimaro
+        except ImportError:
+            raise ImportError(
+                "kimimaro is required for TEASAR skeletonization but is not installed. "
+                "The pipeline now uses MCFSkeletonizer by default. "
+                "Install kimimaro separately if you need SkeletonExtractor."
+            ) from None
 
         self.logger.info(
             f"[teasar] Running kimimaro (scale={teasar_scale}, "
@@ -872,3 +889,554 @@ def quick_write_swc(
 ) -> str:
     """One-call SWC writer.  Returns output_path."""
     return SWCWriter().write_swc(tree, output_path, metadata=metadata)
+
+
+# =============================================================================
+# MCF (Mean Curvature Flow) mesh-based skeletonizer
+# =============================================================================
+
+class MCFSkeletonizer:
+    """
+    Convert binary voxel masks to SWC using CGAL Mean Curvature Flow + MASCAF.
+
+    Pipeline:
+        1. Voxel mask → watertight OBJ (marching cubes + trimesh)
+        2. OBJ shifted to global physical space (add bbox origin)
+        3. Watertight OBJ → skeleton polylines (CGAL mesh_skeletonize)
+        4. Filter degenerate polylines
+        5. OBJ + polylines → morphology graph (MASCAF CableFitter)
+        6. Morphology graph → SWC (MASCAF to_swc_file)
+        7. Stitch orphan roots, prune short spurs
+        8. Prepend metadata header
+
+    Coordinate conventions:
+        - Mask axis order:        (Z, Y, X)
+        - voxel_size_um tuple:    (sx, sy, sz) — X first, matches VAST API
+        - marching cubes spacing: (sz, sy, sx) — must match mask axis order
+        - OBJ / SWC output:       (X, Y, Z) global physical µm
+    """
+
+    def __init__(
+        self,
+        output_dir: str,
+        bin_dir: Optional[str] = None,
+        logger: Optional[logging.Logger] = None,
+    ):
+        self.output_dir = Path(output_dir).resolve()
+        self.logger = logger or logging.getLogger(__name__)
+
+        if bin_dir is not None:
+            self.bin_dir = Path(bin_dir)
+        else:
+            env_dir = os.environ.get("MASCAF_CGAL_BIN_DIR")
+            if not env_dir:
+                raise RuntimeError(
+                    "MCFSkeletonizer: set bin_dir or MASCAF_CGAL_BIN_DIR env var "
+                    "to the directory containing mesh_skeletonize.exe"
+                )
+            self.bin_dir = Path(env_dir)
+
+    # -------------------------------------------------------------------------
+    # Private helpers (ported from sandbox/skeletonization.py)
+    # -------------------------------------------------------------------------
+
+    def _build_watertight_mesh(self, mask: np.ndarray, voxel_size_um: tuple):
+        """Generate a trimesh from a binary voxel mask, applying in-memory repair.
+
+        mask: Boolean (Z, Y, X). Returns trimesh in (X, Y, Z) LOCAL physical space.
+        If still not watertight after fill_holes, returns the mesh anyway — the caller
+        is responsible for attempting CGAL repair before use.
+        """
+        sx, sy, sz = voxel_size_um
+        spacing = (sz, sy, sx)  # match (Z, Y, X) mask axis order
+
+        padded = np.pad(mask, pad_width=1, constant_values=0)
+        verts, faces, _, _ = measure.marching_cubes(padded, level=0.5, spacing=spacing)
+        verts = verts - np.array(spacing)  # undo padding offset
+
+        mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+        trimesh.repair.fix_normals(mesh)
+        mesh.vertices = mesh.vertices[:, ::-1]  # (Z, Y, X) → (X, Y, Z)
+
+        if mesh.is_watertight:
+            self.logger.info(
+                f"Watertight mesh: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces"
+            )
+            return mesh
+
+        # Stage A: fill_holes — zero disk I/O, handles simple open boundary loops
+        trimesh.repair.fill_holes(mesh)
+        if mesh.is_watertight:
+            self.logger.info(
+                f"Watertight after fill_holes: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces"
+            )
+            return mesh
+
+        self.logger.info("Mesh not watertight after fill_holes — will attempt CGAL repair")
+        return mesh  # caller handles Stage B (CGAL repair) after saving to disk
+
+    def _filter_polylines(self, poly_path: str, min_length_um: float = 0.1) -> int:
+        """Remove degenerate/tiny polylines from CGAL output in-place.
+
+        Removes polylines with < 3 points or total length < min_length_um.
+        Returns number of polylines removed.
+        """
+        kept: List[str] = []
+        removed = 0
+        with open(poly_path) as f:
+            for line in f:
+                parts = line.split()
+                if not parts:
+                    continue
+                n = int(parts[0])
+                coords = np.array(parts[1:], dtype=float).reshape(n, 3)
+                if n < 3:
+                    removed += 1
+                    continue
+                length = float(np.sum(np.linalg.norm(np.diff(coords, axis=0), axis=1)))
+                if length < min_length_um:
+                    removed += 1
+                    continue
+                kept.append(line)
+        with open(poly_path, 'w') as f:
+            f.writelines(kept)
+        return removed
+
+    def _stitch_swc_orphan_roots(
+        self,
+        swc_path: str,
+        max_stitch_distance_um: Optional[float] = None,
+    ) -> int:
+        """Connect orphan roots to the nearest node in a different component.
+
+        Converts a skeleton forest into a single rooted tree by connecting each
+        orphan root (parent=-1, not the canonical root) to its nearest neighbour
+        in a different component. max_stitch_distance_um=None stitches
+        unconditionally. Returns number of orphan roots stitched.
+        """
+        
+
+        comments: List[str] = []
+        nodes: Dict[int, list] = {}
+
+        with open(swc_path) as f:
+            for line in f:
+                stripped = line.rstrip('\n')
+                if stripped.lstrip().startswith('#') or not stripped.strip():
+                    comments.append(stripped)
+                    continue
+                parts = stripped.split()
+                if len(parts) < 7:
+                    continue
+                nid = int(parts[0])
+                nodes[nid] = [int(parts[1]), float(parts[2]), float(parts[3]),
+                               float(parts[4]), float(parts[5]), int(parts[6])]
+
+        if not nodes:
+            return 0
+
+        roots = [nid for nid, row in nodes.items() if row[5] == -1]
+        if len(roots) <= 1:
+            return 0
+
+        children: Dict[int, List[int]] = {nid: [] for nid in nodes}
+        for nid, row in nodes.items():
+            pid = row[5]
+            if pid != -1 and pid in children:
+                children[pid].append(nid)
+
+        def bfs_component(start: int) -> set:
+            comp: set = set()
+            queue = [start]
+            while queue:
+                n = queue.pop()
+                if n in comp:
+                    continue
+                comp.add(n)
+                queue.extend(children[n])
+            return comp
+
+        components = {r: bfs_component(r) for r in roots}
+        primary_root = max(components, key=lambda r: len(components[r]))
+        orphan_roots = [r for r in roots if r != primary_root]
+
+        if not orphan_roots:
+            return 0
+
+        all_ids = list(nodes.keys())
+        positions = np.array([[nodes[nid][1], nodes[nid][2], nodes[nid][3]]
+                               for nid in all_ids])
+        kdtree = KDTree(positions)
+
+        node_to_comp: Dict[int, int] = {}
+        for r, comp in components.items():
+            for n in comp:
+                node_to_comp[n] = r
+
+        stitched = 0
+        for orphan_root in orphan_roots:
+            orphan_pos = np.array([nodes[orphan_root][1],
+                                   nodes[orphan_root][2],
+                                   nodes[orphan_root][3]])
+            orphan_comp = components[node_to_comp[orphan_root]]
+
+            dists, idxs = kdtree.query(orphan_pos, k=len(all_ids))
+            dists = np.atleast_1d(np.asarray(dists))
+            idxs  = np.atleast_1d(np.asarray(idxs, dtype=int))
+            target_nid: Optional[int] = None
+            for dist, idx in zip(dists, idxs):
+                candidate = all_ids[int(idx)]
+                if candidate in orphan_comp:
+                    continue
+                if max_stitch_distance_um is not None and dist > max_stitch_distance_um:
+                    break
+                target_nid = candidate
+                break
+
+            if target_nid is not None:
+                nodes[orphan_root][5] = target_nid
+                target_comp_root = node_to_comp[target_nid]
+                for n in orphan_comp:
+                    node_to_comp[n] = target_comp_root
+                components[target_comp_root] = components[target_comp_root] | orphan_comp
+                stitched += 1
+
+        with open(swc_path, 'w') as f:
+            for c in comments:
+                f.write(c + '\n')
+            for nid in sorted(nodes):
+                r = nodes[nid]
+                f.write(f"{nid} {r[0]} {r[1]:.6f} {r[2]:.6f} {r[3]:.6f} {r[4]:.6f} {r[5]}\n")
+
+        return stitched
+
+    def _prune_swc_spurs(self, swc_path: str, min_branch_length_um: float) -> int:
+        """Remove leaf branches shorter than min_branch_length_um in-place.
+
+        Iterates until no further short spurs remain. Never removes the root
+        or an entire single-branch tree. Returns total nodes removed.
+        """
+        comments: List[str] = []
+        nodes: Dict[int, list] = {}
+
+        with open(swc_path) as f:
+            for line in f:
+                stripped = line.rstrip('\n')
+                if stripped.lstrip().startswith('#') or not stripped.strip():
+                    comments.append(stripped)
+                    continue
+                parts = stripped.split()
+                if len(parts) < 7:
+                    continue
+                nid = int(parts[0])
+                nodes[nid] = [int(parts[1]), float(parts[2]), float(parts[3]),
+                               float(parts[4]), float(parts[5]), int(parts[6])]
+
+        if not nodes:
+            return 0
+
+        children: Dict[int, List[int]] = {nid: [] for nid in nodes}
+        root: Optional[int] = None
+        for nid, row in nodes.items():
+            pid = row[5]
+            if pid == -1:
+                root = nid
+            elif pid in children:
+                children[pid].append(nid)
+
+        if root is None:
+            return 0
+
+        def edge_len(a: int, b: int) -> float:
+            ra, rb = nodes[a], nodes[b]
+            return float(np.sqrt(
+                (ra[1] - rb[1])**2 + (ra[2] - rb[2])**2 + (ra[3] - rb[3])**2
+            ))
+
+        total_removed = 0
+        changed = True
+        while changed:
+            changed = False
+            leaves = [nid for nid, clist in children.items()
+                      if len(clist) == 0 and nid != root]
+            for leaf in leaves:
+                spur: List[int] = []
+                length = 0.0
+                reached_root = False
+                nid = leaf
+                while True:
+                    spur.append(nid)
+                    pid = nodes[nid][5]
+                    if pid == -1:
+                        reached_root = True
+                        break
+                    length += edge_len(nid, pid)
+                    if len(children[pid]) > 1:
+                        break
+                    nid = pid
+
+                if reached_root or length >= min_branch_length_um:
+                    continue
+
+                for rem in spur:
+                    pid = nodes[rem][5]
+                    if pid in children:
+                        children[pid] = [c for c in children[pid] if c != rem]
+                    del children[rem]
+                    del nodes[rem]
+                total_removed += len(spur)
+                changed = True
+
+        with open(swc_path, 'w') as f:
+            for c in comments:
+                f.write(c + '\n')
+            for nid in sorted(nodes):
+                r = nodes[nid]
+                f.write(f"{nid} {r[0]} {r[1]:.6f} {r[2]:.6f} {r[3]:.6f} {r[4]:.6f} {r[5]}\n")
+
+        return total_removed
+
+    def _prepend_swc_metadata(self, swc_path: str, metadata: dict) -> None:
+        """Prepend # key: value header lines to an existing SWC file.
+
+        _parse_swc_header() in main_pipeline.py reads these to restore
+        coord_frame, bbox_min_vox, etc. when SWC files are reloaded via
+        --from-phase 2.
+        """
+        with open(swc_path) as f:
+            existing = f.read()
+        with open(swc_path, 'w') as f:
+            f.write("# SWC format skeleton\n")
+            f.write("# Generated by VAST Neural Reconstruction Pipeline\n")
+            f.write("# Skeletonization method: CGAL Mean Curvature Flow (MASCAF)\n")
+            for key, val in metadata.items():
+                f.write(f"# {key}: {val}\n")
+            f.write("# Columns: id, type, x, y, z, radius, parent_id\n")
+            f.write("#\n")
+            for line in existing.splitlines(keepends=True):
+                if not line.startswith('#'):
+                    f.write(line)
+
+    def _compute_stats_from_swc(
+        self,
+        swc_path: str,
+        input_voxel_count: int,
+        n_spurs: int,
+        n_stitched: int,
+        watertight: bool,
+    ) -> Dict[str, Any]:
+        """Lightweight SWC parse to produce the stats dict Phase 1 expects."""
+        pos: Dict[int, tuple] = {}
+        parent_map: Dict[int, int] = {}
+
+        with open(swc_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                parts = line.split()
+                nid = int(parts[0])
+                pos[nid]        = (float(parts[2]), float(parts[3]), float(parts[4]))
+                parent_map[nid] = int(parts[6])
+
+        n_nodes = len(pos)
+        children_count: Dict[int, int] = {nid: 0 for nid in pos}
+        total_length = 0.0
+        for nid, pid in parent_map.items():
+            if pid == -1:
+                continue
+            pa = np.array(pos[pid])
+            pb = np.array(pos[nid])
+            total_length += float(np.linalg.norm(pa - pb))
+            children_count[pid] = children_count.get(pid, 0) + 1
+
+        n_edges      = sum(1 for pid in parent_map.values() if pid != -1)
+        branch_count = sum(1 for c in children_count.values() if c > 1)
+        endpoint_count = sum(
+            1 for nid in pos
+            if children_count.get(nid, 0) == 0 and parent_map[nid] != -1
+        )
+
+        return {
+            'input_voxel_count':          input_voxel_count,
+            'skeleton_vertices':          n_nodes,
+            'skeleton_edges':             n_edges,
+            'branches_pruned':            n_spurs,
+            'components_dropped':         0,
+            'bouton_clusters_collapsed':  0,
+            'bouton_nodes_removed':       0,
+            'bouton_radius_threshold_um': 0.0,
+            'dense_clusters_collapsed':   0,
+            'branch_count':               branch_count,
+            'endpoint_count':             endpoint_count,
+            'total_length_um':            total_length,
+            'coord_frame':                'physical_um_xyz_center',
+            'watertight':                 watertight,
+            'orphan_roots_stitched':      n_stitched,
+        }
+
+    def _empty_stats(self, input_voxel_count: int, watertight: bool = False) -> Dict[str, Any]:
+        """Return a zeroed stats dict for failure cases."""
+        return {
+            'input_voxel_count':          input_voxel_count,
+            'skeleton_vertices':          0,
+            'skeleton_edges':             0,
+            'branches_pruned':            0,
+            'components_dropped':         0,
+            'bouton_clusters_collapsed':  0,
+            'bouton_nodes_removed':       0,
+            'bouton_radius_threshold_um': 0.0,
+            'dense_clusters_collapsed':   0,
+            'branch_count':               0,
+            'endpoint_count':             0,
+            'total_length_um':            0.0,
+            'coord_frame':                'physical_um_xyz_center',
+            'watertight':                 watertight,
+            'orphan_roots_stitched':      0,
+        }
+
+    # -------------------------------------------------------------------------
+    # Public entry point
+    # -------------------------------------------------------------------------
+
+    def skeletonize(
+        self,
+        mask: np.ndarray,
+        voxel_size_um: Tuple[float, float, float],
+        bbox_min_vox: Tuple[int, int, int],
+        swc_path: str,
+        stem: str,
+        spur_length_um: float = 2.0,
+        metadata: Optional[Dict[str, Any]] = None,
+        quality_speed_tradeoff: float = 0.1,
+        medially_centered_speed_tradeoff: float = 5.0,
+        max_edge_length: float = 1.0,
+        radius_strategy: str = "section_median",
+        min_polyline_length_um: float = 0.1,
+        max_stitch_distance_um: Optional[float] = None,
+    ) -> Tuple[bool, Dict[str, Any]]:
+        """
+        Full pipeline: voxel mask → SWC via CGAL MCF + MASCAF.
+
+        Args:
+            mask:           Boolean (Z, Y, X) voxel mask.
+            voxel_size_um:  (sx, sy, sz) voxel size in µm — X first.
+            bbox_min_vox:   (minx, miny, minz) global bbox origin in voxels.
+            swc_path:       Destination SWC path.
+            stem:           Filename stem for intermediate files.
+            spur_length_um: Prune leaf branches shorter than this (0 = off).
+            metadata:       Written as # key: value SWC header lines.
+
+        Returns:
+            (success: bool, stats: dict)
+        """
+        
+
+        input_voxel_count = int(np.sum(mask))
+
+        # Step 1: mesh in local physical space (fill_holes applied if needed)
+        mesh = self._build_watertight_mesh(mask, voxel_size_um)
+
+        # Step 2: shift from local to global physical space
+        sx, sy, sz = voxel_size_um
+        minx, miny, minz = bbox_min_vox
+        mesh.vertices[:, 0] += minx * sx
+        mesh.vertices[:, 1] += miny * sy
+        mesh.vertices[:, 2] += minz * sz
+
+        # Save OBJ
+        mesh_dir = self.output_dir / "meshes"
+        mesh_dir.mkdir(parents=True, exist_ok=True)
+        obj_path = str(mesh_dir / f"{stem}.obj")
+        mesh.export(obj_path)
+        self.logger.info(f"OBJ saved: {obj_path}")
+
+        # Stage B: CGAL mesh_repair if still not watertight after fill_holes
+        if not mesh.is_watertight:
+            repaired_path = str(mesh_dir / f"{stem}_repaired.obj")
+            try:
+                CGALOperator(executable_dir=self.bin_dir, cpp_dir=self.bin_dir).repair(
+                    obj_path, repaired_path
+                )
+                repaired = trimesh.load_mesh(repaired_path)
+                if repaired.is_watertight:
+                    self.logger.info(
+                        f"Watertight after CGAL repair: {len(repaired.vertices)} vertices"
+                    )
+                    obj_path = repaired_path
+                else:
+                    self.logger.warning("CGAL repair did not produce a watertight mesh — skipping")
+                    return False, self._empty_stats(input_voxel_count, watertight=False)
+            except Exception as e:
+                self.logger.warning(f"CGAL repair failed: {e} — skipping")
+                return False, self._empty_stats(input_voxel_count, watertight=False)
+
+        # Step 3: CGAL MCF skeletonization
+        poly_dir = self.output_dir / "polylines"
+        poly_dir.mkdir(parents=True, exist_ok=True)
+        poly_path = str(poly_dir / f"{stem}.polylines.txt")
+
+        try:
+            operator = CGALOperator(executable_dir=self.bin_dir, cpp_dir=self.bin_dir)
+            operator.skeletonize(
+                obj_path,
+                poly_path,
+                quality_speed_tradeoff=quality_speed_tradeoff,
+                medially_centered_speed_tradeoff=medially_centered_speed_tradeoff,
+            )
+        except Exception as e:
+            self.logger.error(f"CGAL skeletonize failed: {e}")
+            return False, self._empty_stats(input_voxel_count, watertight=True)
+        self.logger.info(f"Polylines saved: {poly_path}")
+
+        # Step 4: filter degenerate polylines
+        n_removed = self._filter_polylines(poly_path, min_polyline_length_um)
+        if n_removed:
+            self.logger.info(f"Filtered {n_removed} degenerate polylines")
+
+        # Step 5: MASCAF morphology fit + SWC
+        try:
+            mesh_mgr   = MeshManager(mesh_path=obj_path)
+            skeleton   = SkeletonGraph.from_txt(poly_path)
+            fit_opts   = FitOptions(max_edge_length=max_edge_length,
+                                    radius_strategy=radius_strategy)
+            morphology = CableFitter(fit_opts).fit(mesh_mgr, skeleton)
+            Path(swc_path).parent.mkdir(parents=True, exist_ok=True)
+            morphology.to_swc_file(swc_path)
+        except Exception as e:
+            self.logger.error(f"MASCAF fit failed: {e}")
+            return False, self._empty_stats(input_voxel_count, watertight=True)
+        self.logger.info(f"SWC (pre-fixup): {swc_path}")
+
+        # Step 6: stitch orphan roots
+        n_stitched = self._stitch_swc_orphan_roots(swc_path, max_stitch_distance_um)
+        if n_stitched:
+            self.logger.info(f"Stitched {n_stitched} orphan roots")
+
+        # Step 7: prune short spurs
+        n_spurs = 0
+        if spur_length_um > 0.0:
+            n_spurs = self._prune_swc_spurs(swc_path, spur_length_um)
+            self.logger.info(
+                f"Spur pruning removed {n_spurs} nodes (threshold {spur_length_um} µm)"
+            )
+
+        # Step 8: prepend metadata header
+        if metadata:
+            self._prepend_swc_metadata(swc_path, metadata)
+
+        # Step 9: compute stats from final SWC
+        try:
+            skel_stats = self._compute_stats_from_swc(
+                swc_path, input_voxel_count, n_spurs, n_stitched, watertight=True
+            )
+        except Exception as e:
+            self.logger.warning(f"Stats computation failed: {e}")
+            skel_stats = self._empty_stats(input_voxel_count, watertight=True)
+
+        self.logger.info(
+            f"SWC saved: {swc_path}  "
+            f"({skel_stats['skeleton_vertices']} nodes, "
+            f"{skel_stats['total_length_um']:.2f} µm)"
+        )
+        return True, skel_stats
