@@ -1,9 +1,11 @@
 *.vsseg
 *.vsv
-
-# Ignore the VAST package folder and its contents
+*.egg-info/
 VAST_package_1_5_0/
 __pycache__/*
-vast_export/logs/*
-vast_export/meshes/*
-.claude/*
+*.pyc
+vast_export/*
+.*/*
+diag_output/*
+cpp/build/**
+.env

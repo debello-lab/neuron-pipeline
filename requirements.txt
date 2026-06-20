@@ -1,0 +1,12 @@
+# ms-neuron-pipeline dependencies
+# Python >= 3.12 required
+#
+# Managed via uv — use `uv sync` rather than pip install -r.
+# This file is kept for reference; pyproject.toml is authoritative.
+
+numpy
+scipy
+scikit-image
+networkx
+crackle-codec
+edt

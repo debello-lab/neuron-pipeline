@@ -896,7 +896,7 @@ class VASTControlClass:
             msg += self._encode_uint32(layer_info["solomode"])
             xflags |= 16384
 
-        # If after all that xflags is still 0, nothing is set → no-op
+        # If after all that xflags is still 0, nothing is set -> no-op
         if xflags == 0:
             self.last_error = 0
             return True

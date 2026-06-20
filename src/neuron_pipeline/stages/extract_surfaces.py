@@ -1,22 +1,22 @@
 """
-Production Surface Extraction for VAST Segmentation Data
-Neural Reconstruction Pipeline
+Surface Extraction for VAST Segmentation Data
 
 This module extracts 3D surface meshes from individual segments in VAST datasets.
 Designed for neurons ranging from thousands to tens of millions of voxels.
 
+Functions for extracting obj/ply meshes as well as voxel masks for skeletonization.
+
 Author: Nicolas Randazzo
-Date: 2026-02-03
 """
 
 import numpy as np
 from skimage import measure
 from typing import Optional, Tuple, Dict, Any
-import os
+import sys
 import logging
 from datetime import datetime
 from pathlib import Path
-from VastControlClass_exporting import VASTControlClass
+from vastpy.control.exporting import VASTControlClass
 
 
 class SegmentSurfaceExtractor:
@@ -31,24 +31,32 @@ class SegmentSurfaceExtractor:
     - Production-grade quality assurance
     """
     
-    def __init__(self, vast: VASTControlClass, output_dir: str = "./output"):
+    def __init__(self, vast: VASTControlClass, output_dir: str = "./output",
+                 logger: Optional[logging.Logger] = None):
         """
         Initialize the extractor.
-        
+
         Args:
             vast: Connected VASTControlClass instance
             output_dir: Base directory for output files
+            logger: Shared pipeline logger. If provided, used directly and no
+                    per-instance log file is created. If None, a per-instance
+                    file logger is created (legacy behaviour).
         """
         self.vast = vast
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        
+
         # Setup logging
-        self._setup_logging()
+        if logger is not None:
+            self.logger = logger
+        else:
+            self._setup_logging()
         
         # Cache dataset info
-        self.dataset_info = None
+        self.dataset_info: Dict[str, Any] = None  # type: ignore
         self._load_dataset_info()
+        assert self.dataset_info is not None, "Dataset info must be loaded"
         
         # Memory management settings (can be tuned)
         self.max_block_voxels = 512 ** 3  # ~134M voxels max per block (conservative)
@@ -103,14 +111,17 @@ class SegmentSurfaceExtractor:
         self.logger.info(f"Voxel size: {info['voxelsizex']:.3f} x {info['voxelsizey']:.3f} x {info['voxelsizez']:.3f} nm")
         
         # Get MIP scale factors for segmentation layer
-        selected_layer, selected_em_layer, selected_segment_layer = self.vast.get_selected_layernr()
-        if selected_layer:
-            seg_layer = selected_layer
-            self.mip_factors = self.vast.get_mipmap_scale_factors(seg_layer)
-            self.logger.debug(f"Segmentation layer: {seg_layer}")
-        else:
-            self.mip_factors = None
-            self.logger.warning("Could not retrieve MIP scale factors")
+        layer_info  = self.vast.get_selected_layernr()
+        if layer_info is not None:
+            selected_layer, selected_em_layer, selected_segment_layer = layer_info
+            if selected_layer:
+                seg_layer = selected_layer
+                self.mip_factors = self.vast.get_mipmap_scale_factors(seg_layer)
+                self.logger.debug(f"Segmentation layer: {seg_layer}")
+            else:
+                self.mip_factors = None
+                self.logger.warning("Could not retrieve MIP scale factors")
+        
     
     def _set_socket_timeout(self, timeout_seconds):
         """Temporarily change socket timeout for large data transfers."""
@@ -231,7 +242,7 @@ class SegmentSurfaceExtractor:
         self,
         bbox_size: list,
         miplevel: int,
-        max_voxels_per_block: int = None
+        max_voxels_per_block: int
         ) -> Tuple[int, int, int]:
         """
         Calculate optimal block dimensions for processing.
@@ -296,16 +307,20 @@ class SegmentSurfaceExtractor:
         Returns:
             Tuple of (merged_vertices, merged_faces)
         """
+
         # Handle empty cases
-        if verts1 is None or len(verts1) == 0:
-            if verts2 is None or len(verts2) == 0:
+        if verts1 is None or (isinstance(verts1, np.ndarray) and len(verts1) == 0):
+            if verts2 is None or (isinstance(verts2, np.ndarray) and len(verts2) == 0):
                 return np.array([]), np.array([])
+            assert verts2 is not None and faces2 is not None
             return verts2.copy(), faces2.copy()
-        
-        if verts2 is None or len(verts2) == 0:
+
+        if verts2 is None or (isinstance(verts2, np.ndarray) and len(verts2) == 0):
+            assert verts1 is not None and faces1 is not None
             return verts1.copy(), faces1.copy()
         
         # Merge vertices
+        assert verts1 is not None and verts2 is not None
         merged_verts = np.vstack([verts1, verts2])
         
         # Offset face indices for second mesh
@@ -360,7 +375,7 @@ class SegmentSurfaceExtractor:
         try:
             seg_image = self.vast.get_seg_image_rle_decoded(
                 miplevel, minx, maxx, miny, maxy, minz, maxz,
-                surfonlyflag=0, flipflag=0
+                surfonlyflag=1, flipflag=0
             )
         finally:
             self._set_socket_timeout(10)
@@ -380,19 +395,34 @@ class SegmentSurfaceExtractor:
         self.logger.debug(f"  Block has {int(voxel_count):,} voxels")
         
         del seg_image
-        
-        # Add boundary padding if closing surfaces
+
+        # Pad only the faces of this block that touch the dataset boundary.
+        # Internal block faces already have a zero ring from the overlap extension
+        # fetched in _extract_with_blocks.  Padding internal faces with extra zeros
+        # would create spurious cap triangles at every block seam.
         offset_adjust = np.array([0, 0, 0])
         if close_surfaces:
-            padded = np.zeros((
-                binary_volume.shape[0] + 2,
-                binary_volume.shape[1] + 2,
-                binary_volume.shape[2] + 2
-            ), dtype=np.float32)
-            padded[1:-1, 1:-1, 1:-1] = binary_volume
-            binary_volume = padded
-            offset_adjust = np.array([-1, -1, -1])
-        
+            at_min_z = (minz <= global_bounds[4])
+            at_max_z = (maxz >= global_bounds[5])
+            at_min_y = (miny <= global_bounds[2])
+            at_max_y = (maxy >= global_bounds[3])
+            at_min_x = (minx <= global_bounds[0])
+            at_max_x = (maxx >= global_bounds[1])
+            pad_z0 = 1 if at_min_z else 0
+            pad_z1 = 1 if at_max_z else 0
+            pad_y0 = 1 if at_min_y else 0
+            pad_y1 = 1 if at_max_y else 0
+            pad_x0 = 1 if at_min_x else 0
+            pad_x1 = 1 if at_max_x else 0
+            needs_close = (pad_z0 or pad_z1 or pad_y0 or pad_y1 or pad_x0 or pad_x1)
+            if needs_close:
+                binary_volume = np.pad(
+                    binary_volume,
+                    ((pad_z0, pad_z1), (pad_y0, pad_y1), (pad_x0, pad_x1)),
+                    mode='constant', constant_values=0
+                )
+                offset_adjust = np.array([-pad_z0, -pad_y0, -pad_x0], dtype=float)
+
         # Run marching cubes
         try:
             verts, faces, normals, values = measure.marching_cubes(
@@ -469,7 +499,7 @@ class SegmentSurfaceExtractor:
             maxz = maxz // mip_scale[2]
         
         # Get dataset bounds
-        mip_scale_val = mip_scale if isinstance(mip_scale, list) else [1, 1, 1]
+        mip_scale_val = list(mip_scale) if mip_scale is not None else [1, 1, 1]
         max_x_bound = (self.dataset_info['datasizex'] >> miplevel) - 1
         max_y_bound = (self.dataset_info['datasizey'] >> miplevel) - 1
         max_z_bound = self.dataset_info['datasizez'] - 1
@@ -489,7 +519,7 @@ class SegmentSurfaceExtractor:
         
         # Calculate block dimensions
         region_size = [maxx - minx + 1, maxy - miny + 1, maxz - minz + 1]
-        blocks_x, blocks_y, blocks_z = self._calculate_block_dimensions(region_size, miplevel)
+        blocks_x, blocks_y, blocks_z = self._calculate_block_dimensions(region_size, miplevel, self.max_block_voxels)
         
         total_blocks = blocks_x * blocks_y * blocks_z
         self.logger.info(f"Processing {total_blocks} blocks total")
@@ -539,7 +569,7 @@ class SegmentSurfaceExtractor:
                                 block_verts, block_faces
                             )
                             self.logger.info(f"  Block contributed {len(block_verts):,} vertices, " +
-                                        f"{len(block_faces):,} faces")
+                                        f"{len(block_faces) if block_faces is not None else 0:,} faces")
                             self.logger.info(f"  Total so far: {len(merged_verts):,} vertices, " +
                                         f"{len(merged_faces):,} faces")
             
@@ -549,6 +579,7 @@ class SegmentSurfaceExtractor:
                 self.logger.error("No geometry generated from any block")
                 return None, None
             
+            assert merged_faces is not None
             self.logger.info(f"Final mesh: {len(merged_verts):,} vertices, {len(merged_faces):,} faces")
             
             return merged_verts, merged_faces
@@ -556,6 +587,10 @@ class SegmentSurfaceExtractor:
         finally:
             # Always clear translation
             self.vast.set_seg_translation([], [])
+
+    #######################################################
+    # Extracting mesh
+    #######################################################
 
     def extract_segment(
         self,
@@ -619,6 +654,7 @@ class SegmentSurfaceExtractor:
                 self.logger.error("Surface extraction produced no geometry")
                 return None, None, None
             
+            assert faces is not None
             # Save to file
             output_path = self._save_mesh(
                 vertices, 
@@ -632,7 +668,7 @@ class SegmentSurfaceExtractor:
             self.logger.info("=" * 80)
             self.logger.info("Extraction completed successfully!")
             self.logger.info(f"  Vertices: {len(vertices):,}")
-            self.logger.info(f"  Faces: {len(faces):,}")
+            self.logger.info(f"  Faces: {len(faces) if faces is not None else 0:,}")
             self.logger.info(f"  Output: {output_path}")
             self.logger.info("=" * 80)
             
@@ -679,22 +715,42 @@ class SegmentSurfaceExtractor:
             minz = minz // mip_scale[2]
             maxz = maxz // mip_scale[2]
         
-        mip_scale_val = mip_scale if isinstance(mip_scale, list) else [1, 1, 1]
+        mip_scale_val = list(mip_scale) if mip_scale is not None else [1, 1, 1]
         max_x_bound = (self.dataset_info['datasizex'] >> miplevel) - 1
         max_y_bound = (self.dataset_info['datasizey'] >> miplevel) - 1
         max_z_bound = self.dataset_info['datasizez'] - 1
         if miplevel > 0 and mip_scale_val[2] != 1:
             max_z_bound = max_z_bound // mip_scale_val[2]
 
-        # Add padding for marching cubes, clamped to dataset bounds
-        padding = 2 if close_surfaces else 1
-        minx = max(0, minx - padding)
-        miny = max(0, miny - padding)
-        minz = max(0, minz - padding)
-        maxx = min(max_x_bound, maxx + padding)  # CLAMP
-        maxy = min(max_y_bound, maxy + padding)  # CLAMP
-        maxz = min(max_z_bound, maxz + padding)  # CLAMP
-        
+        # Add 1-voxel padding around the segment bounding box so marching cubes
+        # sees zeros outside the neuron on faces that don't touch the dataset edge.
+        # Faces that DO touch the dataset edge cannot be extended (no data exists
+        # beyond the boundary) -- those faces are handled by the explicit zero-pad
+        # below (close_surfaces=True), which only activates on clamped faces.
+        minx = max(0, minx - 1)
+        miny = max(0, miny - 1)
+        minz = max(0, minz - 1)
+        maxx = min(max_x_bound, maxx + 1)
+        maxy = min(max_y_bound, maxy + 1)
+        maxz = min(max_z_bound, maxz + 1)
+
+        # Track which faces hit the dataset boundary (cannot extend further).
+        # close_surfaces will only pad these faces with explicit zeros.
+        at_min_x = (minx == 0)
+        at_min_y = (miny == 0)
+        at_min_z = (minz == 0)
+        at_max_x = (maxx == max_x_bound)
+        at_max_y = (maxy == max_y_bound)
+        at_max_z = (maxz == max_z_bound)
+        needs_close = (at_min_x or at_min_y or at_min_z or
+                       at_max_x or at_max_y or at_max_z)
+        if close_surfaces and needs_close:
+            self.logger.info(
+                "Segment touches dataset boundary -- will pad boundary faces with zeros: "
+                f"min=({at_min_x},{at_min_y},{at_min_z}) "
+                f"max=({at_max_x},{at_max_y},{at_max_z})"
+            )
+
         self.logger.info(f"Loading volume at MIP {miplevel}")
         self.logger.info(f"  Region: X=[{minx},{maxx}] Y=[{miny},{maxy}] Z=[{minz},{maxz}]")
         
@@ -711,7 +767,7 @@ class SegmentSurfaceExtractor:
         try:
             seg_image = self.vast.get_seg_image_rle_decoded(
                 miplevel, minx, maxx, miny, maxy, minz, maxz,
-                surfonlyflag=0, flipflag=0
+                surfonlyflag=1, flipflag=0
             )
         finally:
             # Always clear translation
@@ -739,19 +795,37 @@ class SegmentSurfaceExtractor:
         # Free up memory
         del seg_image
         
-        # Add boundary padding if closing surfaces
+        # Pad only the faces that touch the dataset boundary with explicit zeros
+        # so that marching cubes closes the isosurface there.  Faces that don't
+        # touch the boundary already have a zero ring from the 1-voxel bounding-
+        # box extension fetched above.
+        #
+        # The binary_volume axis order matches the VAST return convention: (Z,Y,X).
+        # Boundary flags therefore map as:
+        #   axis 0 = Z:  at_min_z -> pad front,  at_max_z -> pad back
+        #   axis 1 = Y:  at_min_y -> pad top,    at_max_y -> pad bottom
+        #   axis 2 = X:  at_min_x -> pad left,   at_max_x -> pad right
         offset_adjust = np.array([0, 0, 0])
-        if close_surfaces:
-            self.logger.debug("Adding boundary padding for closed surfaces")
-            padded = np.zeros((
-                binary_volume.shape[0] + 2,
-                binary_volume.shape[1] + 2,
-                binary_volume.shape[2] + 2
-            ), dtype=np.float32)
-            padded[1:-1, 1:-1, 1:-1] = binary_volume
-            binary_volume = padded
-            offset_adjust = np.array([-1, -1, -1])
-        
+        if close_surfaces and needs_close:
+            self.logger.debug("Padding dataset-boundary faces with zeros for surface closure")
+            # Determine how many slices to add on each side per axis.
+            # (1 slice is enough; marching cubes only needs one zero layer.)
+            pad_z0 = 1 if at_min_z else 0
+            pad_z1 = 1 if at_max_z else 0
+            pad_y0 = 1 if at_min_y else 0
+            pad_y1 = 1 if at_max_y else 0
+            pad_x0 = 1 if at_min_x else 0
+            pad_x1 = 1 if at_max_x else 0
+            binary_volume = np.pad(
+                binary_volume,
+                ((pad_z0, pad_z1), (pad_y0, pad_y1), (pad_x0, pad_x1)),
+                mode='constant', constant_values=0
+            )
+            # Shift marching-cubes output back so coordinates stay in the
+            # original fetch-region frame.  Only axes that got a leading pad
+            # need an offset correction.
+            offset_adjust = np.array([-pad_z0, -pad_y0, -pad_x0], dtype=float)
+
         # Run marching cubes
         self.logger.info("Running marching cubes algorithm...")
         try:
@@ -798,6 +872,282 @@ class SegmentSurfaceExtractor:
         
         return verts, faces
     
+    ########################################################
+    # Extracting voxel data
+    ########################################################
+    
+    def extract_segment_voxel(
+        self,
+        segment_id: int,
+        miplevel: int = 0,
+        padding: int = 1,
+        output_filename: Optional[str] = None
+    ) -> Tuple[Optional[np.ndarray], Optional[Tuple[int, int, int]], Optional[Tuple[float, float, float]], Optional[str]]:
+        """
+        Extract voxel mask for a single segment (for skeletonization pipeline).
+        
+        This method extracts the raw binary voxel mask without any cleaning operations.
+        The mask can then be passed to cleaning and skeletonization functions.
+        
+        Args:
+            segment_id: Segment ID to extract
+            miplevel: MIP level (0 = full resolution, higher = coarser)
+            padding: Voxels of padding around bounding box
+            output_filename: Optional filename for saving mask as .npy
+            
+        Returns:
+            Tuple of (mask, bbox_min_vox, voxel_size_um, output_path)
+            - mask: bool[z, y, x] - Boolean 3D array of segment voxels
+            - bbox_min_vox: (minx, miny, minz) - Origin coordinates in voxel space
+            - voxel_size_um: (sx, sy, sz) - Voxel dimensions in microns (includes MIP scaling)
+            - output_path: Path to saved .npy file (if output_filename provided) or None
+            Returns (None, None, None, None) if extraction fails
+            
+        Example:
+            >>> extractor = SegmentSurfaceExtractor(vast)
+            >>> mask, origin, voxel_size, path = extractor.extract_segment_voxel(
+            ...     segment_id=1, 
+            ...     miplevel=1,
+            ...     output_filename="segment_001_mask.npy"
+            ... )
+            >>> # mask is ready for cleaning and skeletonization
+        """
+        self.logger.info("=" * 80)
+        self.logger.info(f"Starting voxel extraction for segment {segment_id}")
+        self.logger.info("=" * 80)
+        
+        try:
+            # Get segment metadata
+            metadata = self.get_segment_metadata(segment_id)
+            if metadata is None:
+                self.logger.error(f"Cannot extract segment {segment_id} - metadata retrieval failed")
+                return None, None, None, None
+            
+            # Extract the mask
+            mask, bbox_min_vox, voxel_size_um = self._extract_full_volume_mask(
+                segment_id, 
+                metadata, 
+                miplevel,
+                padding
+            )
+            
+            if mask is None:
+                self.logger.error("Voxel mask extraction failed")
+                return None, None, None, None
+            
+            voxel_count = np.sum(mask)
+            if voxel_count == 0:
+                self.logger.error(f"Segment {segment_id} has no voxels in extracted region")
+                return None, None, None, None
+            
+            self.logger.info(f"Extracted mask: {mask.shape} with {int(voxel_count):,} voxels")
+            self.logger.info(f"  Origin (voxels): {bbox_min_vox}")
+            self.logger.info(f"  Voxel size (um): {voxel_size_um}")
+            
+            # Save to file if requested
+            output_path = None
+            if output_filename:
+                output_path = self._save_voxel_mask(
+                    mask,
+                    bbox_min_vox,
+                    voxel_size_um,
+                    metadata,
+                    output_filename
+                )
+            
+            # Log success
+            self.logger.info("=" * 80)
+            self.logger.info("Voxel extraction completed successfully!")
+            self.logger.info(f"  Mask shape: {mask.shape}")
+            self.logger.info(f"  Voxel count: {int(voxel_count):,}")
+            if output_path:
+                self.logger.info(f"  Output: {output_path}")
+            self.logger.info("=" * 80)
+            
+            return mask, bbox_min_vox, voxel_size_um, output_path
+            
+        except Exception as e:
+            self.logger.error(f"Voxel extraction failed: {str(e)}", exc_info=True)
+            return None, None, None, None
+
+    def _extract_full_volume_mask(
+        self,
+        segment_id: int,
+        metadata: Dict[str, Any],
+        miplevel: int,
+        padding: int = 1
+    ) -> Tuple[np.ndarray, Tuple[int, int, int], Tuple[float, float, float]]:
+        """
+        Extract the binary voxel mask for a segment at a specific MIP level.
+        
+        This is a low-level extraction method that returns the raw binary mask
+        without any cleaning operations. The mask is suitable for further processing
+        in the skeletonization pipeline.
+        
+        Args:
+            segment_id: Segment ID to extract
+            metadata: Segment metadata from get_segment_metadata()
+            miplevel: MIP level (0 = full resolution)
+            padding: Voxels of padding to add around bounding box (default: 1)
+            
+        Returns:
+            Tuple of (mask, bbox_min_vox, voxel_size_um)
+            - mask: bool[z, y, x] - Boolean mask of the segment
+            - bbox_min_vox: (minx, miny, minz) - Minimum x/y/z used to fetch the volume in voxels
+            - voxel_size_um: (sx, sy, sz) - Voxel size in microns, including mip scaling
+            
+        Note:
+            - Z dimension may not be MIP-scaled depending on dataset configuration
+            - Coordinates are in (Z, Y, X) order following numpy convention
+            - Returns (None, None, None) on failure
+        """
+        bbox = metadata['bbox']
+        
+        # Adjust bounding box for MIP level
+        mip_scale = [1, 1, 1]
+        if miplevel > 0 and self.mip_factors is not None and miplevel <= len(self.mip_factors):
+            mip_scale = self.mip_factors[miplevel - 1]
+        
+        minx = bbox[0] >> miplevel
+        maxx = bbox[3] >> miplevel
+        miny = bbox[1] >> miplevel
+        maxy = bbox[4] >> miplevel
+        minz = bbox[2]
+        maxz = bbox[5]
+        
+        if miplevel > 0 and mip_scale[2] != 1:
+            minz = minz // mip_scale[2]
+            maxz = maxz // mip_scale[2]
+        
+        mip_scale_val = list(mip_scale) if mip_scale is not None else [1, 1, 1]
+        max_x_bound = (self.dataset_info['datasizex'] >> miplevel) - 1
+        max_y_bound = (self.dataset_info['datasizey'] >> miplevel) - 1
+        max_z_bound = self.dataset_info['datasizez'] - 1
+        if miplevel > 0 and mip_scale_val[2] != 1:
+            max_z_bound = max_z_bound // mip_scale_val[2]
+
+        # Add padding around bounding box, clamped to dataset bounds
+        minx = max(0, minx - padding)
+        miny = max(0, miny - padding)
+        minz = max(0, minz - padding)
+        maxx = min(max_x_bound, maxx + padding)  # CLAMP
+        maxy = min(max_y_bound, maxy + padding)  # CLAMP
+        maxz = min(max_z_bound, maxz + padding)  # CLAMP
+        
+        self.logger.info(f"Loading volume at MIP {miplevel}")
+        self.logger.info(f"  Region: X=[{minx},{maxx}] Y=[{miny},{maxy}] Z=[{minz},{maxz}]")
+        
+        # Set translation to isolate this segment
+        self.vast.set_seg_translation([segment_id], [segment_id])
+        
+        # Load segmentation data
+        # Increase timeout for large transfers (estimate: 1 second per 10M voxels)
+        volume_size = (maxx - minx + 1) * (maxy - miny + 1) * (maxz - minz + 1)
+        estimated_timeout = max(60, int(volume_size / 10_000_000) * 10)  # At least 60 seconds
+        self.logger.debug(f"Setting socket timeout to {estimated_timeout}s for {volume_size:,} voxel request")
+        self._set_socket_timeout(estimated_timeout)
+
+        try:
+            seg_image = self.vast.get_seg_image_rle_decoded(
+                miplevel, minx, maxx, miny, maxy, minz, maxz,
+                surfonlyflag=1, flipflag=0
+            )
+        finally:
+            # Always clear translation
+            self.vast.set_seg_translation([], [])
+            # Reset to default timeout
+            self._set_socket_timeout(10)
+        
+        if seg_image is None:
+            self.logger.error("Failed to load segmentation data from VAST")
+            return np.array([]), (0, 0, 0), (0.0, 0.0, 0.0) #Tuple[np.ndarray, Tuple[int, int, int], Tuple[float, float, float]]
+        
+        self.logger.info(f"Loaded volume shape: {seg_image.shape}")
+        
+        # Create binary volume
+        self.logger.info("Creating binary volume...")
+        mask = (seg_image == segment_id).astype(bool)
+        # get_seg_image_rle_decoded returns (X, Y, Z) via Fortran-order reshape.
+        # All downstream stages (distance_transform_edt sampling, skeleton_to_graph,
+        # centroid code, structuring element) expect (Z, Y, X) -- transpose here once.
+        mask = mask.transpose(2, 1, 0)
+
+        # Store the min bounds in voxels
+        bbox_min_vox = (minx, miny, minz)
+        
+        # Calculate voxel size in microns, including mip scaling
+        # Base voxel sizes from dataset info (in nm)
+        base_voxel_size = np.array([
+            self.dataset_info['voxelsizex'],
+            self.dataset_info['voxelsizey'],
+            self.dataset_info['voxelsizez']
+        ])
+        
+        # Apply MIP scaling
+        voxel_size_nm = base_voxel_size * mip_scale_val
+        
+        # Convert to microns
+        voxel_size_um = tuple(voxel_size_nm * 0.001)
+
+        return mask, bbox_min_vox, voxel_size_um
+    
+    def _save_voxel_mask(
+        self,
+        mask: np.ndarray,
+        bbox_min_vox: Tuple[int, int, int],
+        voxel_size_um: Tuple[float, float, float],
+        metadata: Dict[str, Any],
+        custom_filename: Optional[str]
+    ) -> str:
+        """
+        Save voxel mask and metadata to .npz file.
+        
+        Args:
+            mask: Boolean voxel mask
+            bbox_min_vox: Origin coordinates in voxel space
+            voxel_size_um: Voxel dimensions in microns
+            metadata: Segment metadata
+            custom_filename: Custom filename or None
+            
+        Returns:
+            Path to saved file
+        """
+        # Generate filename
+        if custom_filename:
+            base_name = custom_filename
+            if not base_name.endswith('.npz'):
+                base_name += '.npz'
+        else:
+            # Clean segment name for filename
+            clean_name = metadata['name'].replace(' ', '_')
+            # Remove special characters
+            clean_name = ''.join(c for c in clean_name if c.isalnum() or c in ['_', '-'])
+            base_name = f"seg_{metadata['id']:04d}_{clean_name}_mask.npz"
+        
+        # Create output directory structure
+        voxels_dir = self.output_dir / "voxels"
+        voxels_dir.mkdir(exist_ok=True)
+        
+        output_path = voxels_dir / base_name
+        
+        # Save mask and metadata
+        np.savez_compressed(
+            output_path,
+            mask=mask,
+            bbox_min_vox=bbox_min_vox,
+            voxel_size_um=voxel_size_um,
+            segment_id=metadata['id'],
+            segment_name=metadata['name']
+        )
+        
+        self.logger.info(f"Saved voxel mask: {output_path}")
+        
+        return str(output_path)
+
+    #######################################################
+    # Saving meshes 
+    #######################################################
+
     def _save_mesh(
         self,
         vertices: np.ndarray,
@@ -927,63 +1277,3 @@ class SegmentSurfaceExtractor:
             for face in faces:
                 f.write(f"3 {int(face[0])} {int(face[1])} {int(face[2])}\n")
 
-
-def main():
-    """Example usage demonstrating single segment extraction."""
-    print("=" * 80)
-    print("VAST Surface Extraction - Single Segment")
-    print("=" * 80)
-    
-    # Connect to VAST
-    vast = VASTControlClass()
-    print("\nConnecting to VAST...")
-    
-    if not vast.connect("127.0.0.1", 22081, timeout=10):
-        print("ERROR: Failed to connect to VAST")
-        print("  - Ensure VAST is running")
-        print("  - Enable API in VAST Preferences")
-        return
-    
-    print("Connected to VAST")
-    
-    try:
-        # Create extractor
-        extractor = SegmentSurfaceExtractor(vast, output_dir="./vast_export")
-        
-        num_segments = vast.get_number_of_segments()
-        for id in range(1,num_segments):
-            segment_id = id
-            
-            print(f"\nExtracting segment {segment_id}...")
-            print("This may take several minutes for large neurons...\n")
-            
-            vertices, faces, output_path = extractor.extract_segment(
-                segment_id=segment_id,
-                miplevel=1,  # Full resolution
-                close_surfaces=False,
-                output_format='obj'
-            )
-            
-            if vertices is not None:
-                print("\n" + "=" * 80)
-                print("SUCCESS!")
-                print("=" * 80)
-                print(f"Mesh saved to: {output_path}")
-                print(f"Vertices: {len(vertices):,}")
-                print(f"Faces: {len(faces):,}")
-
-            else:
-                print("\nExtraction failed - check logs for details")
-                
-    except Exception as e:
-        print(f"\nERROR: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        
-    finally:
-        vast.disconnect()
-        print("\nDisconnected from VAST")
-
-
-if __name__ == "__main__":
-    main()
